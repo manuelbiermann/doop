@@ -12,29 +12,39 @@ import {
   type SyncKeyInfo,
 } from '../lib/api'
 import { navigate } from '../App'
-import { Logo } from '../components/Logo'
+import { DoopMark, Logo } from '../components/Logo'
 import { ensureTab } from '../lib/desktop'
 import { Stage } from '../components/Stage'
 import { Board } from '../components/Board'
 import { Inspector } from '../components/Inspector'
+import { ElementPanel } from '../components/ElementPanel'
 import { ActivityPanel } from '../components/ActivityPanel'
 import { ConnectModal } from '../components/ConnectModal'
-import { LimitWall } from '../components/TeamAllowance'
+import { LimitWall, isResidentLimit } from '../components/TeamAllowance'
 import { PromptBar } from '../components/PromptBar'
 import { WorkingNow } from '../components/WorkingNow'
+import { SideRail } from '../components/SideRail'
+import { LayersPanel, LayersRailToggle } from '../components/LayersPanel'
 import { Onboarding } from '../components/Onboarding'
 import { ShareModal } from '../components/ShareModal'
+import { PresentMode } from '../components/PresentMode'
 import { BrainIcon } from '../components/BrainIcon'
 import { getIdentity, setName } from '../lib/identity'
-import { copyFrame, duplicateFrame, hasFrameClip, pasteFrameCentered, pasteImagesCentered } from '../lib/frameClipboard'
-import { clearHistory, deleteFrameTracked, recordCreate, redo, undo } from '../lib/history'
+import {
+  copyFrames,
+  duplicateFrames,
+  hasFrameClip,
+  pasteFrameCentered,
+  pasteImagesCentered,
+} from '../lib/frameClipboard'
+import { clearHistory, deleteFramesTracked, recordCreate, redo, undo } from '../lib/history'
 import { authClient } from '../lib/auth'
 import { posthog } from '../lib/posthog'
 import { useIsMobile } from '../hooks/use-mobile'
 import { cn } from '@/lib/utils'
 import { Button } from '../components/ui/button'
 import { Sheet, SheetContent, SheetDescription, SheetTitle } from '../components/ui/sheet'
-import { GithubIcon } from '../components/ui/icons'
+import { GithubIcon, ImportIcon, MoreHorizontalIcon, PlayIcon, PulseIcon, SparkIcon } from '../components/ui/icons'
 import { Badge } from '../components/ui/badge'
 import { Input } from '../components/ui/input'
 import { Field } from '../components/ui/field'
@@ -82,6 +92,7 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
   const [view, setView] = useState<'canvas' | 'board'>('canvas')
   const [showConnect, setShowConnect] = useState(false)
   const [showShare, setShowShare] = useState(false)
+  const [presenting, setPresenting] = useState(false)
   /* returning from a GitHub App install: the setup redirect appends a signed
      pass — pull it off the URL and open the import modal on the repo picker */
   const [ghInstallPass, setGhInstallPass] = useState<string | null>(() => {
@@ -119,7 +130,7 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
       select(null)
       clearHistory()
     }
-  }, [canvasId])
+  }, [canvasId, select])
 
   /* broadcast which frame I'm focused on */
   useEffect(() => {
@@ -131,31 +142,32 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
     function onKey(e: KeyboardEvent) {
       const t = e.target as HTMLElement
       if (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable) return
-      const sel = useStore.getState().selectedId
-      if ((e.key === 'Delete' || e.key === 'Backspace') && sel) {
+      const selectedIds = useStore.getState().selectedIds
+      if ((e.key === 'Delete' || e.key === 'Backspace') && selectedIds.length) {
         e.preventDefault()
-        const frame = useStore.getState().canvas?.frames.find((f) => f.id === sel)
-        if (frame) deleteFrameTracked(frame)
+        const frames = useStore.getState().canvas?.frames.filter((f) => selectedIds.includes(f.id)) ?? []
+        deleteFramesTracked(frames)
       }
       if (e.key === 'Escape') select(null)
       if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === 'z') {
         e.preventDefault()
-        if (e.shiftKey) redo()
-        else undo()
+        if (e.shiftKey) void redo()
+        else void undo()
         return
       }
       if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'y') {
         e.preventDefault()
-        redo()
+        void redo()
         return
       }
       if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey) {
-        const frame = useStore.getState().canvas?.frames.find((f) => f.id === sel)
+        /* ⌘C and ⌘D act on the whole selection */
+        const frames = useStore.getState().canvas?.frames.filter((f) => selectedIds.includes(f.id)) ?? []
         /* don't hijack ⌘C when the user is copying selected text */
-        if (e.key === 'c' && frame && !window.getSelection()?.toString()) copyFrame(frame)
-        if (e.key === 'd' && frame) {
+        if (e.key === 'c' && frames.length && !window.getSelection()?.toString()) copyFrames(frames)
+        if (e.key === 'd' && frames.length) {
           e.preventDefault()
-          duplicateFrame(frame)
+          duplicateFrames(frames)
         }
       }
     }
@@ -238,13 +250,27 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
   /* a right-click that selected the frame keeps the Inspector out until the
      context menu closes — it would slide in right under the open menu */
   const deferPanel = useStore((s) => !!s.ctxMenu?.deferPanel)
+  const layersOpen = useStore((s) => s.layersOpen)
+  /* the element panel takes the frame inspector's spot while a Layers row
+     has it open; it follows the element selection until it is closed */
+  const selectedElement = useStore((s) => s.selectedElement)
+  const elementPanelOpen = useStore((s) => s.elementPanelOpen)
+  const panelElement = elementPanelOpen && selectedElement?.frameId === selectedFrame?.id ? selectedElement : null
+  /* both right-hand property panels sit beside the Activity panel when it is
+     open, beside the collapsed side rail otherwise */
+  const propertiesPanelCls = showActivity ? 'right-[324px]' : 'right-[72px]'
 
   return (
     /* --app-inset is 0 normally; the impersonation shell raises it so this
        fixed layer starts below the banner instead of under it */
     <div className="fixed inset-x-0 bottom-0 top-[var(--app-inset,0px)] flex flex-col">
-      <div className="z-40 flex h-[52px] flex-none items-center gap-3 border-b border-line bg-surface px-3 max-md:h-[112px] max-md:flex-wrap max-md:content-center max-md:gap-x-2 max-md:gap-y-1.5 max-md:px-2 max-md:py-2">
-        <div className="flex min-w-0 items-center gap-1.5 max-md:basis-full">
+      {/* Three tiers. Desktop (≥ md): one row with the full action set. Tablet
+          (xs..md): still one row — the id badge and the text actions fold
+          into the ••• sheet so the name and the view switch keep their room.
+          Phone (< xs): two rows, the name on top, the switch and the actions
+          below it, each at its natural width. */}
+      <div className="z-40 flex h-14 flex-none items-center gap-4 border-b border-line bg-surface px-4 max-md:gap-2.5 max-md:px-3 max-xs:h-[100px] max-xs:flex-wrap max-xs:content-center max-xs:gap-y-2 max-xs:py-2">
+        <div className="flex min-w-0 items-center gap-1.5 max-xs:basis-full">
           <Tooltip label="All canvases" side="bottom" align="start">
             <Button
               variant="bare"
@@ -267,7 +293,7 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
           )}
         </div>
         <Segmented
-          className="max-md:order-2 max-md:flex-1"
+          className="shrink-0 max-xs:order-2"
           aria-label="View"
           value={view}
           onValueChange={(next) => setView(next as 'canvas' | 'board')}
@@ -275,8 +301,18 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
           <SegmentedItem value="canvas">Canvas</SegmentedItem>
           <SegmentedItem value="board">Board</SegmentedItem>
         </Segmented>
-        <div className="ml-auto flex items-center gap-3 max-md:hidden">
-          <div className="flex items-center" title={others.map((p) => p.name).join(', ') || 'Just you here'}>
+        <div className="ml-auto flex items-center gap-2.5 max-md:hidden">
+          <Button
+            variant="bare"
+            className="h-8 px-2.5 text-[12.5px] font-medium"
+            onClick={() => setShowImport(true)}
+            title="Import a live web page as a frame"
+          >
+            <ImportIcon className="size-[13px]" />
+            Import
+          </Button>
+          <BarDivider />
+          <div className="flex items-center px-0.5" title={others.map((p) => p.name).join(', ') || 'Just you here'}>
             <Button
               variant="bare"
               className="p-0 hover:bg-transparent"
@@ -297,46 +333,77 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
               />
             ))}
           </div>
-          <Button variant="ghost" onClick={() => setShowActivity((v) => !v)}>
-            Activity
+          <BarDivider />
+          <Tooltip label={selectedId ? 'Present this frame' : 'Select a frame to present'} side="bottom">
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-[34px] rounded-[7px] bg-surface hover:border-ink-faint hover:bg-paper-deep disabled:opacity-40"
+              aria-label="Present selected frame"
+              disabled={!selectedId}
+              onClick={() => setPresenting(true)}
+            >
+              <PlayIcon className="size-3.5" />
+            </Button>
+          </Tooltip>
+          <Button
+            variant="ghost"
+            className="h-[34px] rounded-[7px] bg-surface px-[17px] text-[12.5px] font-semibold hover:border-ink-faint hover:bg-paper-deep"
+            onClick={() => setShowShare(true)}
+          >
+            Share
           </Button>
-          <Button variant="ghost" onClick={() => setShowImport(true)} title="Import a live web page as a frame">
-            ⤓ Import
-          </Button>
-          <Button onClick={() => setShowShare(true)}>Share</Button>
           <Button
             variant="primary"
+            className="h-[34px] rounded-[7px] px-[13px] text-[12.5px]"
             onClick={() => {
               posthog.capture('agent_connection_opened')
               setShowConnect(true)
             }}
           >
-            ✦ Connect AI
+            <SparkIcon className="size-3" />
+            Connect AI
           </Button>
         </div>
-        <div className="order-3 hidden items-center gap-1.5 max-md:flex">
-          <Button variant="ghost" className="h-10 bg-surface" onClick={() => setShowActivity(true)}>
-            Activity
-          </Button>
+        <div className="ml-auto hidden items-center gap-1.5 max-md:flex max-xs:order-3">
+          <div
+            className="mr-1 flex items-center max-sm:hidden"
+            title={others.map((p) => p.name).join(', ') || 'Just you here'}
+          >
+            <Avatar name={me.name} kind="user" stacked />
+            {others.map((p) => (
+              <Avatar
+                key={p.clientId}
+                name={p.name}
+                color={p.color}
+                kind={p.kind}
+                status={p.status}
+                owner={p.owner}
+                stacked
+              />
+            ))}
+          </div>
           <Button
             variant="primary"
-            className="h-10"
+            className="h-[34px] rounded-[7px] px-[13px] text-[12.5px]"
             onClick={() => {
               posthog.capture('agent_connection_opened')
               setShowConnect(true)
             }}
           >
-            ✦ AI
+            <SparkIcon className="size-3" />
+            <span className="max-sm:hidden">Connect AI</span>
+            <span className="sm:hidden">AI</span>
           </Button>
           <Tooltip label="Canvas actions" side="bottom" align="end">
             <Button
               variant="ghost"
               size="icon"
-              className="size-10 bg-surface"
+              className="size-[34px] rounded-[7px] bg-surface"
               aria-label="Canvas actions"
               onClick={() => setShowMobileActions(true)}
             >
-              •••
+              <MoreHorizontalIcon />
             </Button>
           </Tooltip>
         </div>
@@ -350,7 +417,7 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
             <Stage onAddFrame={addFrame} />
             <div
               className={cn(
-                'pointer-events-none absolute top-3 right-3 z-30 flex flex-col items-end gap-2 transition-[right] duration-150 ease-[ease] [&>*]:pointer-events-auto max-md:top-[56px] max-md:right-2 max-md:left-2',
+                'pointer-events-none absolute top-3 right-[72px] z-30 flex flex-col items-end gap-2 transition-[right] duration-150 ease-[ease] [&>*]:pointer-events-auto max-md:top-[56px] max-md:right-2 max-md:left-2',
                 /* clear of the 300px side panel at right: 12px */
                 showActivity && 'right-[324px]',
               )}
@@ -365,7 +432,7 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
                       setShowActivity(true)
                     }}
                   >
-                    ✦ Memory suggestion — review
+                    <DoopMark size={12} /> Memory suggestion — review
                   </Button>
                   <Button
                     variant="bare"
@@ -399,7 +466,19 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
             <WorkingNow />
             <PromptBar canvasId={canvasId} />
             <Onboarding />
-            {!isMobile && selectedFrame && inspectorOpen && !deferPanel && <Inspector frame={selectedFrame} />}
+            {!isMobile && (layersOpen ? <LayersPanel onAddFrame={addFrame} /> : <LayersRailToggle />)}
+            {!isMobile && selectedFrame && panelElement && !deferPanel && (
+              <ElementPanel
+                key={`${selectedFrame.id}|${panelElement.selector}`}
+                frame={selectedFrame}
+                selector={panelElement.selector}
+                className={propertiesPanelCls}
+              />
+            )}
+            {!isMobile && selectedFrame && inspectorOpen && !panelElement && !deferPanel && (
+              <Inspector frame={selectedFrame} className={propertiesPanelCls} />
+            )}
+            {!isMobile && !showActivity && <SideRail onOpen={() => setShowActivity(true)} />}
             {!isMobile && showActivity && <ActivityPanel onClose={() => setShowActivity(false)} />}
           </>
         )}
@@ -441,6 +520,16 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
                 </Button>
                 <Button
                   variant="ghost"
+                  className="h-11 justify-start border-line bg-surface px-4"
+                  onClick={() => {
+                    setShowMobileActions(false)
+                    setShowActivity(true)
+                  }}
+                >
+                  <PulseIcon /> Agents & activity
+                </Button>
+                <Button
+                  variant="ghost"
                   className="h-11 justify-start px-4 text-ink-soft"
                   onClick={() => navigate('/settings')}
                 >
@@ -479,6 +568,7 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
 
       {renaming && <RenameSelfModal current={me.name} onClose={() => setRenaming(false)} />}
       {showConnect && <ConnectModal canvasId={canvasId} onClose={() => setShowConnect(false)} />}
+      {presenting && selectedId && <PresentMode frameId={selectedId} onClose={() => setPresenting(false)} />}
       {showShare && canvas && (
         <ShareModal
           key={canvas.id}
@@ -518,13 +608,14 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
             setShowImport(false)
             setView('canvas')
             select(frameIds[0] ?? null)
-            const imported =
-              frameIds.length === 0
-                ? 'Doop is importing the design system — watch the canvas'
-                : frameIds.length === 1
-                  ? '1 item imported'
-                  : `${frameIds.length} items imported`
+            const imported = frameIds.length === 1 ? '1 item imported' : `${frameIds.length} items imported`
             showToast(failedCount ? `${imported} · ${failedCount} failed` : imported)
+          }}
+          onQueued={(cardCount) => {
+            setShowImport(false)
+            setGhInstallPass(null)
+            setView('board')
+            showToast(`${cardCount} ${cardCount === 1 ? 'card' : 'cards'} queued — Doop is on it`)
           }}
         />
       )}
@@ -540,18 +631,26 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
   )
 }
 
+/* hairline between the top bar's clusters: actions | presence | sharing */
+function BarDivider() {
+  return <span aria-hidden className="mx-1 h-[22px] w-px bg-line-soft" />
+}
+
 function ImportModal({
   canvasId,
   installPass,
   installError,
   onClose,
   onDone,
+  onQueued,
 }: {
   canvasId: string
   installPass: string | null
   installError: string | null
   onClose: () => void
   onDone: (frameIds: string[], failedCount: number) => void
+  /** a repo import queues cards on the board instead of landing frames */
+  onQueued: (cardCount: number) => void
 }) {
   const [url, setUrl] = useState('')
   const [wholeSite, setWholeSite] = useState(false)
@@ -673,22 +772,27 @@ function ImportModal({
     const screens = repoReview.manifest.screens.filter((s) => repoSelected.has(screenKey(s)))
     try {
       const result = await api.importGithubScreens(canvasId, repoReview.connection.id, screens, extractSystem)
-      if (!result.frames.length && screens.length) {
-        const reason = result.failures[0]?.error
-        setError(reason ? `No screens could be imported — ${reason}` : 'No screens could be imported')
+      if (!result.cards.length) {
+        setError(
+          result.rejected.length
+            ? 'Those screens are no longer in the repository — re-run the scan'
+            : 'Everything you picked is already on the board',
+        )
         setBusy(null)
         return
       }
       posthog.capture('github_screens_imported', {
         requested_count: screens.length,
-        imported_count: result.frames.length,
-        failed_count: result.failures.length,
+        queued_count: result.cards.length,
+        rejected_count: result.rejected.length,
       })
-      onDone(
-        result.frames.map((frame) => frame.id),
-        result.failures.length,
-      )
+      onQueued(result.cards.length)
     } catch (e) {
+      if (isResidentLimit(e)) {
+        useStore.getState().setLimitWall(true)
+        onClose()
+        return
+      }
       setError(errorMessage(e, 'repository import failed'))
       setBusy(null)
     }
@@ -724,8 +828,9 @@ function ImportModal({
             </div>
             <ModalLede>
               {repoReview.manifest.framework ? `A ${repoReview.manifest.framework} app. ` : ''}Doop distills the repo's
-              design system into a style guide pinned to this canvas — every agent follows it from then on. Components
-              come along as sketched library cards; whole pages are optional.
+              design system into a style guide pinned to this canvas — every agent follows it from then on. Each
+              component or page you pick becomes a card on the board: Doop sketches it from the source and lands it as a
+              frame. Whole pages are optional.
             </ModalLede>
             <CheckboxCard
               checked={extractSystem}
@@ -737,11 +842,6 @@ function ImportModal({
             <div className="mt-4 flex items-center justify-between px-[2px] pb-[9px]">
               <b className="text-[12px] text-ink-soft">
                 {repoSelected.size} of {visibleScreens.length} selected
-                {repoSelected.size > 12 && (
-                  <span className="ml-2 font-normal text-ink-faint">
-                    — Doop sketches 12 per import; the rest stay outlines
-                  </span>
-                )}
               </b>
               <span className="flex gap-3">
                 <Button
@@ -887,8 +987,8 @@ function ImportModal({
                 }}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') {
-                    if (wholeSite) discover()
-                    else runSinglePage()
+                    if (wholeSite) void discover()
+                    else void runSinglePage()
                   }
                   if (e.key === 'Escape' && !busy) onClose()
                 }}
@@ -1058,10 +1158,16 @@ function RenameSelfModal({ current, onClose }: { current: string; onClose: () =>
   function save() {
     if (!clean || clean === current || busy) return onClose()
     setBusy(true)
-    authClient.updateUser({ name: clean }).then(() => {
-      setName(clean)
-      location.reload()
-    })
+    authClient.updateUser({ name: clean }).then(
+      () => {
+        setName(clean)
+        location.reload()
+      },
+      (err: unknown) => {
+        console.error(err)
+        setBusy(false)
+      },
+    )
   }
 
   return (
@@ -1456,7 +1562,7 @@ function CanvasName() {
     <Input
       variant="title"
       inputSize="sm"
-      className={cn(canvasNameCls, 'truncate max-md:max-w-[calc(100vw-72px)]')}
+      className={cn(canvasNameCls, 'truncate max-xs:max-w-[calc(100vw-72px)]')}
       value={draft ?? canvas.name}
       size={Math.max(6, (draft ?? canvas.name).length)}
       onFocus={() => setDraft(canvas.name)}

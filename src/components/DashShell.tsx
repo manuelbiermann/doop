@@ -3,6 +3,7 @@ import { authClient } from '../lib/auth'
 import { navigate } from '../App'
 import { posthog } from '../lib/posthog'
 import { useMe } from '../lib/me'
+import { isDesktopShell } from '../lib/shell'
 import { AgentIcon } from './AgentIcon'
 import { ConnectModal } from './ConnectModal'
 import { CodeBlock } from './ui/code-block'
@@ -22,9 +23,10 @@ import {
  *  here so Home and Settings cannot drift apart. */
 
 export function initials(name?: string): string {
-  const parts = (name ?? '').trim().split(/\s+/).filter(Boolean)
-  if (!parts.length) return '·'
-  const letters = parts.length === 1 ? parts[0].slice(0, 2) : parts[0][0] + parts[parts.length - 1][0]
+  const [first, ...rest] = (name ?? '').trim().split(/\s+/).filter(Boolean)
+  if (!first) return '·'
+  const last = rest[rest.length - 1]
+  const letters = last ? first.slice(0, 1) + last.slice(0, 1) : first.slice(0, 2)
   return letters.toUpperCase()
 }
 
@@ -68,7 +70,7 @@ export function AccountMenu() {
           </DropdownMenuItem>
         )}
         <DropdownMenuItem asChild>
-          <a href="/blog" target="_blank" rel="noopener noreferrer">
+          <a href="https://doop.design/docs" target="_blank" rel="noopener noreferrer">
             <IconHelp /> Help &amp; docs
           </a>
         </DropdownMenuItem>
@@ -78,7 +80,11 @@ export function AccountMenu() {
           onSelect={() =>
             authClient.signOut().then(() => {
               posthog.reset()
-              location.reload()
+              /* the shell has no marketing site: a signed-out reload of /
+                 would show the landing page, so it goes to the sign-in form
+                 the shell opens on (main.rs) */
+              if (isDesktopShell()) location.assign('/auth')
+              else location.reload()
             })
           }
         >
@@ -162,6 +168,16 @@ export function IconShare() {
       <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
       <circle cx="9" cy="7" r="3.2" />
       <path d="M22 21v-2a4 4 0 0 0-3-3.8" />
+    </svg>
+  )
+}
+
+/** the gallery: a compass — designs to steer by */
+export function IconCommunity() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" {...stroke} aria-hidden>
+      <circle cx="12" cy="12" r="9" />
+      <path d="m15.5 8.5-2.2 5.3-4.8 1.7 2.2-5.3z" />
     </svg>
   )
 }

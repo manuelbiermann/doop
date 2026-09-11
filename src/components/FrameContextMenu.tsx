@@ -1,8 +1,9 @@
 import type { MutableRefObject } from 'react'
 import type { Frame } from '../../shared/types'
 import { api } from '../lib/api'
-import { copyFrame, duplicateFrame, hasFrameClip, pasteFrameAtScreen } from '../lib/frameClipboard'
-import { deleteFrameTracked } from '../lib/history'
+import { copyFrames, duplicateFrames, hasFrameClip, pasteFrameAtScreen } from '../lib/frameClipboard'
+import { deleteFramesTracked } from '../lib/history'
+import { useStore } from '../lib/store'
 import { MOD_KEY } from '../lib/keys'
 import { ContextMenuContent, ContextMenuItem, ContextMenuSeparator } from './ui/context-menu'
 import { MenuHint } from './ui/menu'
@@ -10,10 +11,20 @@ import { MenuHint } from './ui/menu'
 /** Right-click menu for a frame. FrameView owns the trigger, and passes the
  *  point the right-click happened at — Paste lands there. */
 export function FrameContextMenu({ frame, at }: { frame: Frame; at: MutableRefObject<{ x: number; y: number }> }) {
+  /* a right-click inside a multi-selection acts on the whole group */
+  const groupSize = useStore((s) => (s.selectedIds.includes(frame.id) ? s.selectedIds.length : 1))
+  function groupFrames(): Frame[] {
+    const s = useStore.getState()
+    const ids = s.selectedIds.includes(frame.id) ? s.selectedIds : [frame.id]
+    return s.canvas?.frames.filter((f) => ids.includes(f.id)) ?? [frame]
+  }
+  function deleteSelection() {
+    deleteFramesTracked(groupFrames())
+  }
   return (
     <ContextMenuContent>
-      <ContextMenuItem onSelect={() => copyFrame(frame)}>
-        Copy
+      <ContextMenuItem onSelect={() => copyFrames(groupFrames())}>
+        {groupSize > 1 ? `Copy ${groupSize} frames` : 'Copy'}
         <MenuHint>{MOD_KEY}C</MenuHint>
       </ContextMenuItem>
       <ContextMenuItem
@@ -23,8 +34,8 @@ export function FrameContextMenu({ frame, at }: { frame: Frame; at: MutableRefOb
         Paste
         <MenuHint>{MOD_KEY}V</MenuHint>
       </ContextMenuItem>
-      <ContextMenuItem onSelect={() => duplicateFrame(frame)}>
-        Duplicate
+      <ContextMenuItem onSelect={() => duplicateFrames(groupFrames())}>
+        {groupSize > 1 ? `Duplicate ${groupSize} frames` : 'Duplicate'}
         <MenuHint>{MOD_KEY}D</MenuHint>
       </ContextMenuItem>
       <ContextMenuSeparator />
@@ -50,8 +61,8 @@ export function FrameContextMenu({ frame, at }: { frame: Frame; at: MutableRefOb
         Add to design memory
       </ContextMenuItem>
       <ContextMenuSeparator />
-      <ContextMenuItem tone="danger" onSelect={() => deleteFrameTracked(frame)}>
-        Delete frame
+      <ContextMenuItem tone="danger" onSelect={deleteSelection}>
+        {groupSize > 1 ? `Delete ${groupSize} frames` : 'Delete frame'}
         <MenuHint>⌫</MenuHint>
       </ContextMenuItem>
     </ContextMenuContent>

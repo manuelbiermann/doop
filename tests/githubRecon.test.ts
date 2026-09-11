@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { extractHtml, resolveImport, treeExcerpt } from '../server/githubRecon.ts'
+import {
+  designSystemSlug,
+  extractHtml,
+  nextRepoFramePosition,
+  resolveImport,
+  treeExcerpt,
+} from '../server/githubRecon.ts'
+import { wrapGeneratedHtml } from '../server/github.ts'
 
 /** The reconstruction pass's pure core: import resolution against a repo
  *  tree, and pulling the HTML document (+ declared height) out of a model
@@ -48,6 +55,68 @@ describe('extractHtml', () => {
     expect(extractHtml([{ type: 'text', text: '<!doctype html><p>x</p>' }]).height).toBe(900)
     expect(() => extractHtml([{ type: 'text', text: 'sorry, no' }])).toThrow(/no HTML/)
   })
+
+  it('accepts a generic-language fence (not just ```html)', () => {
+    const { html } = extractHtml([{ type: 'text', text: '```xml\n<!doctype html><p>x</p>\n```' }])
+    expect(html.startsWith('<!doctype html>')).toBe(true)
+  })
+
+  it('accepts an unclosed fence, reading past the truncated marker', () => {
+    const { html } = extractHtml([{ type: 'text', text: '```html\n<!doctype html><p>x</p>' }])
+    expect(html.startsWith('<!doctype html>')).toBe(true)
+  })
+
+  it('adds a doctype to an <html> document that is missing one', () => {
+    const { html, height } = extractHtml([
+      { type: 'text', text: '<html><body>x</body></html>\n<!-- doop-height: 500 -->' },
+    ])
+    expect(html.startsWith('<!doctype html>\n<html>')).toBe(true)
+    expect(height).toBe(500)
+  })
+
+  it('wraps a component fragment (no <html>, no doctype) into a minimal document', () => {
+    const { html, height } = extractHtml([
+      { type: 'text', text: '<div class="card">x</div>\n<!-- doop-height: 300 -->' },
+    ])
+    expect(html.startsWith('<!doctype html>')).toBe(true)
+    expect(html).toContain('<div class="card">x</div>')
+    expect(height).toBe(480) // clamped up from 300
+  })
+
+  it('wraps a bare <style> fragment', () => {
+    const { html } = extractHtml([{ type: 'text', text: '<style>.a { color: red; }</style>' }])
+    expect(html.startsWith('<!doctype html>')).toBe(true)
+    expect(html).toContain('<style>.a { color: red; }</style>')
+  })
+
+  it('wraps any element as a fragment, not just a fixed list', () => {
+    const { html } = extractHtml([{ type: 'text', text: '<button class="primary">Save</button>' }])
+    expect(html).toContain('<body>\n<button class="primary">Save</button>\n</body>')
+  })
+
+  it('gives a wrapped fragment a <head> so the frame wrapper has somewhere to inject', () => {
+    const { html } = extractHtml([{ type: 'text', text: '<div>x</div>' }])
+    expect(html).toContain('<head></head>')
+  })
+
+  it('starts a fragment at the first line that begins with a tag, skipping tags mentioned in prose', () => {
+    const { html } = extractHtml([
+      { type: 'text', text: 'I used a <div> wrapper for the layout:\n\n  <section class="card">real</section>' },
+    ])
+    expect(html).toContain('<body>\n<section class="card">real</section>\n</body>')
+    expect(html).not.toContain('wrapper for the layout')
+  })
+
+  it('prefers an explicit doctype over a fragment tag that appears earlier in the same text', () => {
+    const { html } = extractHtml([
+      { type: 'text', text: 'Explanation with a <div> mention.\n<!doctype html><main>real doc</main>' },
+    ])
+    expect(html.startsWith('<!doctype html><main>real doc</main>')).toBe(true)
+  })
+
+  it('still rejects prose that only contains tag-shaped words, not real tags', () => {
+    expect(() => extractHtml([{ type: 'text', text: 'no divs or mains here, sorry' }])).toThrow(/no HTML/)
+  })
 })
 
 describe('treeExcerpt', () => {
@@ -81,5 +150,52 @@ describe('repo asset references', () => {
   it('extractHtml raises the height ceiling for full pages', () => {
     const { height } = extractHtml([{ type: 'text', text: '<!doctype html><p>x</p>\n<!-- doop-height: 6600 -->' }])
     expect(height).toBe(6600)
+  })
+})
+
+describe('nextRepoFramePosition', () => {
+  const CONN = 'conn-1'
+  const marked = (x: number, y: number, width: number, height: number, conn = CONN) => ({
+    x,
+    y,
+    width,
+    height,
+    html: wrapGeneratedHtml(
+      '<html><head></head><body>x</body></html>',
+      { id: conn, repo: 'a/b', branch: 'main' },
+      {
+        kind: 'component',
+        route: 'src/Button.tsx',
+        sourcePath: 'src/Button.tsx',
+      },
+    ),
+  })
+  const plain = (x: number, y: number, width: number, height: number) => ({ x, y, width, height, html: '<p/>' })
+
+  it('starts the import right of everything on the canvas, or at the origin on an empty one', () => {
+    expect(nextRepoFramePosition([], CONN, 640)).toEqual({ x: 120, y: 120 })
+    expect(nextRepoFramePosition([plain(100, 300, 1000, 500)], CONN, 640)).toEqual({ x: 1180, y: 120 })
+  })
+
+  it('flows siblings into the current row while it fits, then wraps under everything', () => {
+    const frames = [plain(100, 300, 1000, 500), marked(1180, 120, 640, 420)]
+    expect(nextRepoFramePosition(frames, CONN, 640)).toEqual({ x: 1900, y: 120 })
+    const fullRow = [
+      marked(120, 120, 1280, 900),
+      marked(1480, 120, 1280, 700),
+      /* a taller frame in the row decides where the next row starts */
+    ]
+    expect(nextRepoFramePosition(fullRow, CONN, 1280)).toEqual({ x: 120, y: 1100 })
+  })
+
+  it('only counts frames from the same connection as siblings', () => {
+    const frames = [marked(120, 120, 640, 420, 'other-conn')]
+    expect(nextRepoFramePosition(frames, CONN, 640)).toEqual({ x: 840, y: 120 })
+  })
+})
+
+describe('designSystemSlug', () => {
+  it('names the guide after the repository', () => {
+    expect(designSystemSlug('acme/Web.App')).toBe('web-app-design-system')
   })
 })

@@ -11,8 +11,9 @@ import { store } from './store.ts'
 import { getImage } from './previews.ts'
 import * as actions from './actions.ts'
 import { canAccessCanvas, hasDurableCanvasAccess, isAdmin } from './access.ts'
-import { auth, initAuth, syncAdmins, getUserName, PUBLIC_ORIGIN, oidcPublicConfig } from './auth.ts'
+import { auth, initAuth, syncAdmins, getUserName, PUBLIC_ORIGIN, loginProvidersConfig } from './auth.ts'
 import { adminRouter } from './admin.ts'
+import { communityRouter, parseListing, publishableFrames } from './community.ts'
 import * as demo from './demo.ts'
 import { db, initDb } from './db/index.ts'
 import * as authSchema from './db/auth-schema.ts'
@@ -27,10 +28,10 @@ import {
   MAX_ASSET_BYTES,
 } from './assets.ts'
 import * as ingest from './ingest.ts'
+import * as backgrounds from './backgrounds.ts'
+import * as storage from './storage.ts'
 import * as github from './github.ts'
 import * as githubApp from './githubApp.ts'
-import { scheduleReconstructions } from './githubRecon.ts'
-import { pickModel } from './agentModel.ts'
 import { seed } from './seed.ts'
 import * as allowance from './allowance.ts'
 import * as modelAccounts from './modelAccounts.ts'
@@ -59,6 +60,7 @@ const BUILD_ID = (() => {
 
 /* boot: connect the DB, hydrate memory, import pre-DB store.json once */
 await initDb()
+await backgrounds.initBackgrounds()
 initAuth()
 await syncAdmins() // ADMIN_EMAILS -> user.role, for accounts that already exist
 let data = await persist.hydrate()
@@ -112,7 +114,10 @@ process.on('unhandledRejection', (reason) => {
 for (const sig of ['SIGINT', 'SIGTERM'] as const) {
   process.once(sig, () => {
     setTimeout(() => process.exit(0), 1500).unref()
-    persist.flush((id) => store.getFrame(id)).finally(() => process.exit(0))
+    persist
+      .flush((id) => store.getFrame(id))
+      .catch((err) => console.error('flush on shutdown failed', err))
+      .finally(() => process.exit(0))
   })
 }
 
@@ -355,6 +360,25 @@ app.get('/a/:id.:ext', async (req, res) => {
   }
 })
 
+/* Curated background library (server/backgrounds.ts): /bg/<id>.webp and  */
+/* /bg/<id>-t.webp straight from object storage. Public and immutable —  */
+/* the catalog is checked in, the bytes are put there by the import      */
+/* script and never rewritten under the same id.                         */
+app.get('/bg/:file', async (req, res) => {
+  const key = backgrounds.keyForFile(req.params.file)
+  if (!key) return res.status(404).end()
+  try {
+    const buf = await storage.getObject(key)
+    if (!buf) return res.status(404).end()
+    res.set('Content-Type', 'image/webp')
+    res.set('Cache-Control', 'public, max-age=31536000, immutable')
+    res.set('X-Content-Type-Options', 'nosniff')
+    res.send(buf)
+  } catch (e) {
+    res.status(500).json({ error: e instanceof Error ? e.message : 'background fetch failed' })
+  }
+})
+
 /* ------------------------------------------------------------------ */
 /* One-time asset uploads: the upload_asset MCP tool mints a ticket and */
 /* the agent curls the file here (curl -T file /u/<token>), so bytes    */
@@ -426,7 +450,7 @@ app.put('/u/:token', async (req, res) => {
    plugin adds are refused by default rather than discovered later. */
 const MCP_OAUTH_PATHS = /^\/api\/auth\/(mcp\/|oauth2\/(authorize|consent|token))/
 const VIEW_AS_ALLOWED = /^\/api\/auth\/(sign-out|admin\/stop-impersonating)$/
-app.all('/api/auth/*', async (req, res) => {
+app.all('/api/auth/*', async (req, res, next) => {
   const restricted = MCP_OAUTH_PATHS.test(req.path) || (req.method !== 'GET' && !VIEW_AS_ALLOWED.test(req.path))
   if (restricted) {
     const session = await auth.api.getSession({ headers: fromNodeHeaders(req.headers) }).catch(() => null)
@@ -434,7 +458,7 @@ app.all('/api/auth/*', async (req, res) => {
       return res.status(403).json({ error: 'viewing as another user — read only' })
     }
   }
-  toNodeHandler(auth)(req, res)
+  toNodeHandler(auth)(req, res).catch(next)
 })
 
 app.use(express.json({ limit: '10mb' }))
@@ -455,9 +479,9 @@ app.post('/api/account-exists', async (req, res) => {
 
 /* Public: is SSO configured, and what should the login button say? Static
    build shared across self-hosted deploys can't know this at build time —
-   see server/auth.ts oidcPublicConfig for what's safe to expose here. */
+   see server/auth.ts loginProvidersConfig for what's safe to expose here. */
 app.get('/api/oidc-config', (req, res) => {
-  res.json(oidcPublicConfig())
+  res.json(loginProvidersConfig())
 })
 
 /* ------------------------------------------------------------------ */
@@ -563,6 +587,7 @@ function requireFrame(req: express.Request, res: express.Response, frameId: stri
 }
 
 app.use('/api/admin', adminRouter)
+app.use('/api/community', communityRouter)
 
 /* free-tier meter for the resident team: {used, limit, connected, byoModel} */
 app.get('/api/agent-allowance', (req, res) => {
@@ -703,6 +728,27 @@ app.post('/api/canvases/:id/duplicate', async (req, res) => {
 app.get('/api/canvases/:id', (req, res) => {
   const c = requireCanvas(req, res, req.params.id)
   if (c) res.json(c)
+})
+
+/* Community gallery listing — the owner's call alone, like link access.
+   PUT both lists and re-describes; DELETE takes it down. */
+app.put('/api/canvases/:id/publish', (req, res) => {
+  const c = requireCanvas(req, res, req.params.id)
+  if (!c) return
+  if (c.ownerId !== req.user!.id) return res.status(403).json({ error: 'only the owner can publish a canvas' })
+  if (!publishableFrames(c).length) return res.status(400).json({ error: 'add a frame before publishing' })
+  const listing = parseListing(req.body)
+  if (typeof listing === 'string') return res.status(400).json({ error: listing })
+  const published = store.publishCanvas(c.id, listing)!
+  res.json({ publishedAt: published.publishedAt, description: published.description, category: published.category })
+})
+
+app.delete('/api/canvases/:id/publish', (req, res) => {
+  const c = requireCanvas(req, res, req.params.id)
+  if (!c) return
+  if (c.ownerId !== req.user!.id) return res.status(403).json({ error: 'only the owner can unpublish a canvas' })
+  store.unpublishCanvas(c.id)
+  res.json({ ok: true })
 })
 
 app.post('/api/canvases/:id/claim', (req, res) => {
@@ -987,30 +1033,54 @@ app.post('/api/canvases/:id/github/:connId/analyze', async (req, res) => {
   }
 })
 
+/* one import at a time per repo connection — see the route */
+const connectionLocks = new Map<string, Promise<unknown>>()
+async function withConnectionLock<T>(connectionId: string, fn: () => Promise<T>): Promise<T> {
+  const previous = connectionLocks.get(connectionId) ?? Promise.resolve()
+  const run = previous.then(fn, fn)
+  const tail = run.catch(() => {})
+  connectionLocks.set(connectionId, tail)
+  try {
+    return await run
+  } finally {
+    if (connectionLocks.get(connectionId) === tail) connectionLocks.delete(connectionId)
+  }
+}
+
 app.post('/api/canvases/:id/github/:connId/import', async (req, res) => {
   const c = requireDurableCanvas(req, res, req.params.id)
   if (!c) return
   const conn = await github.getConnection(c.id, req.params.connId)
   if (!conn) return res.status(404).json({ error: 'connection not found' })
   if (!takeImportSlot(req.user!.id)) return res.status(429).json({ error: 'too many imports — wait a minute' })
+  /* design-system-only import is the headline flow now — screens optional */
+  const designSystem = req.body?.design_system !== false
+  const rawScreens = Array.isArray(req.body?.screens) ? (req.body.screens as unknown[]) : []
+  if (!rawScreens.length && !designSystem)
+    return res.status(400).json({ error: 'pick components or screens, or enable the design-system extraction' })
   try {
-    const actor = actions.resolveActor({ name: req.user!.name, kind: 'user' })
-    /* code-only screens get agent reconstruction when a model can run it —
-       the requester's own account, else the server tier (same resolution as
-       every other agent task, billed to the same person) */
-    const sketch = !!(await pickModel(req.user!.id))
-    const designSystem = sketch && req.body?.design_system !== false
-    /* design-system-only import is the headline flow now — screens optional */
-    const rawScreens = Array.isArray(req.body?.screens) ? (req.body.screens as unknown[]) : []
-    if (!rawScreens.length && !designSystem)
-      return res.status(400).json({ error: 'pick components or screens, or enable the design-system extraction' })
-    let result: { frames: unknown[]; failures: unknown[] } = { frames: [], failures: [] }
-    let pending: Parameters<typeof scheduleReconstructions>[1] = []
-    if (rawScreens.length) {
-      ;({ pending, ...result } = await github.importScreens(conn, c, rawScreens, actor, { sketch }))
-    }
-    scheduleReconstructions(conn, pending, actor, req.user!.id, { designSystem })
-    res.json(result)
+    /* the selection is resolved against a manifest computed right now — see
+       matchSelection for why the client never dictates paths */
+    const { screens, rejected } = rawScreens.length
+      ? github.matchSelection((await github.analyzeConnection(conn)).screens, rawScreens)
+      : { screens: [], rejected: [] }
+    const input = { connectionId: conn.id, repo: conn.repo, screens, designSystem }
+    /* plan → gate → queue runs one import at a time per connection, so two
+       overlapping imports of the same screens cannot both pass the plan and
+       both pay while only one queues */
+    const outcome = await withConnectionLock(conn.id, async () => {
+      /* nothing new to queue (all rejected, or already on the board) costs nothing */
+      if (!actions.planRepoCards(c.id, input).length) return { cards: [] as string[] }
+      /* the import is the Doop Agent's work, card by card — same gate as a card
+         typed on the board: a free task, or the requester's own model account */
+      const gate = await allowance.consumeResidentTask(req.user!.id)
+      if (!gate.ok) return { limit: gate }
+      const cards = actions.addRepoCards(c.id, input, req.user!.name, req.user!.id)
+      return { cards: cards.map((card) => card.id) }
+    })
+    if (outcome.limit)
+      return res.status(403).json({ error: 'resident_limit', used: outcome.limit.used, limit: outcome.limit.limit })
+    res.json({ cards: outcome.cards, rejected })
   } catch (e) {
     res.status(400).json({ error: e instanceof Error ? e.message : 'import failed' })
   }
@@ -1172,6 +1242,36 @@ app.post('/api/frames/:id/comments', async (req, res) => {
   res.json(comment)
 })
 
+app.post('/api/comments/:id/replies', async (req, res) => {
+  const found = actions.findComment(req.params.id)
+  if (!found) return res.status(404).json({ error: 'comment not found' })
+  if (!requireCanvas(req, res, found.canvasId)) return
+  const text = String(req.body?.text ?? '')
+  if (!text.trim() || !actions.openThread(req.params.id)) {
+    return res.status(404).json({ error: 'thread resolved or empty text' })
+  }
+  /* same rule as a fresh comment: only an @mention costs a resident task */
+  let gate: Awaited<ReturnType<typeof allowance.consumeResidentTask>> | undefined
+  if (mentionedRole(text)) {
+    gate = await allowance.consumeResidentTask(req.user!.id)
+    if (!gate.ok) {
+      return res.status(403).json({ error: 'resident_limit', used: gate.used, limit: gate.limit })
+    }
+  }
+  const reply = actions.replyToComment(req.params.id, text, req.user!.name, req.user!.id)
+  if (!reply) {
+    /* the thread closed while the meter was being written: give the task
+       back — a failed refund is logged, never turned into a 500 */
+    if (gate) {
+      await allowance.refundResidentTask(gate, req.user!.id).catch((err) => {
+        console.error(`[comments] could not refund a resident task for ${req.user!.id}:`, err)
+      })
+    }
+    return res.status(409).json({ error: 'thread resolved meanwhile' })
+  }
+  res.json(reply)
+})
+
 app.post('/api/comments/:id/resolve', (req, res) => {
   const found = actions.findComment(req.params.id)
   if (!found) return res.status(404).json({ error: 'comment not found' })
@@ -1233,7 +1333,8 @@ app.post('/api/canvases/:id/import', async (req, res) => {
       }
       /* Validate the whole batch before consuming a slot or opening Chromium. */
       const validated = requested.map((url) => assertPublicHttpUrl(url))
-      if (validated.some((url) => !isSameSiteUrl(url, validated[0]))) {
+      const [first, ...rest] = validated
+      if (first && rest.some((url) => !isSameSiteUrl(url, first))) {
         return res.status(400).json({ error: 'all selected pages must belong to the same website' })
       }
       const urls = [...new Set(validated.map((url) => url.href))]
@@ -1413,25 +1514,7 @@ app.get('/.well-known/oauth-protected-resource', protectedResourceMetadata)
 /* path-aware variant some clients probe for a resource at /mcp */
 app.get('/.well-known/oauth-protected-resource/mcp', protectedResourceMetadata)
 
-/* Internal-deployment extras, loaded only when configured: a server-rendered
-   /blog (headless WordPress) and a marketing-site proxy for signed-out `/`.
-   Both must precede the SPA catch-all. The module paths go through variables
-   because the open-source export ships without these files — an unresolved
-   static import would break its typecheck, an unexecuted dynamic one can't. */
-if (process.env.WORDPRESS_API_URL) {
-  const blogModule = './blog/index.ts'
-  const { mountBlog } = (await import(blogModule)) as { mountBlog: (a: express.Express) => void }
-  mountBlog(app)
-}
-if (process.env.MARKETING_ORIGIN) {
-  const marketingModule = './marketing.ts'
-  const { mountMarketing } = (await import(marketingModule)) as { mountMarketing: (a: express.Express) => void }
-  mountMarketing(app)
-}
-
-/* robots + minimal sitemap for every deployment. Registered after the blog
-   mount on purpose: a configured blog registered its richer, WP-aware
-   sitemap above, and the first matching route wins. */
+/* robots + minimal sitemap for every deployment */
 app.get('/robots.txt', (_req, res) => {
   res
     .type('text/plain')

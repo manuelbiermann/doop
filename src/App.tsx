@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 import { Home } from './pages/Home'
+import { Community } from './pages/Community'
 import { Settings } from './pages/Settings'
 import { CanvasPage } from './pages/CanvasPage'
 import { AuthPage } from './pages/AuthPage'
-import { Landing } from './pages/Landing'
 import { Admin } from './pages/Admin'
 import { authClient } from './lib/auth'
 import { setName } from './lib/identity'
@@ -13,7 +13,8 @@ import { adminApi } from './lib/api'
 import { Button } from './components/ui/button'
 import { AuthScreen } from './components/ui/screen'
 import { DesktopTabs, ShellDragBar } from './components/DesktopTabs'
-import { isDesktopShell, setTabsUser } from './lib/desktop'
+import { setTabsUser } from './lib/desktop'
+import { isDesktopShell } from './lib/shell'
 
 export function navigate(path: string) {
   history.pushState(null, '', path)
@@ -93,24 +94,17 @@ export function App() {
         <AuthScreen />
       </>
     )
-  if (!session) {
-    /* an interrupted MCP OAuth authorize redirect must land on the sign-in
-       form (its resume logic reads these params), never the marketing page */
-    const params = new URLSearchParams(location.search)
-    const oauthResume = (params.has('client_id') && params.has('response_type')) || params.has('redirect_to')
-    /* share-link visitors (/c/…) go straight to sign-in so the deep link
-       survives — the canvas renders right after the session appears */
-    /* the desktop shell never shows the marketing landing page — signing
-       out (or any signed-out path) lands on the sign-in form instead */
-    if (path.startsWith('/auth') || path.startsWith('/c/') || oauthResume || isDesktopShell())
-      return (
-        <>
-          <ShellDragBar />
-          <AuthPage />
-        </>
-      )
-    return <Landing />
-  }
+  /* signed out: every path lands on the sign-in form. The marketing site is
+     a separate service (see server/marketing.ts) that owns `/` for
+     visitors; share links (/c/…) and interrupted MCP OAuth redirects keep
+     their URL so the deep link / resume logic survives the sign-in. */
+  if (!session)
+    return (
+      <>
+        <ShellDragBar />
+        <AuthPage />
+      </>
+    )
 
   /* /admin waits for /api/me: before it answers we can't tell an admin from
      a borrowed "view as" session, and rendering Admin in the latter flashes
@@ -118,13 +112,15 @@ export function App() {
      session back and reloads. */
   if (path.startsWith('/admin') && (!me || returningToAdmin)) return <div className="auth-page" />
 
-  const canvasMatch = path.match(/^\/c\/([^/]+)/)
-  const page = canvasMatch ? (
-    <CanvasPage canvasId={canvasMatch[1]} key={canvasMatch[1]} />
+  const canvasId = path.match(/^\/c\/([^/]+)/)?.[1]
+  const page = canvasId ? (
+    <CanvasPage canvasId={canvasId} key={canvasId} />
   ) : path.startsWith('/admin') ? (
     <Admin />
   ) : path.startsWith('/settings') ? (
     <Settings />
+  ) : path.startsWith('/community') ? (
+    <Community />
   ) : (
     <Home />
   )

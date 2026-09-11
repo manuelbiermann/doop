@@ -1,4 +1,4 @@
-import type { ActivityItem, Canvas, CanvasMeta, Frame } from '../../shared/types'
+import type { ActivityItem, Canvas, CanvasMeta, CommunityCategory, CommunityItem, Frame } from '../../shared/types'
 
 export type HomeActivity = ActivityItem & { canvasId: string; canvasName: string }
 
@@ -74,9 +74,12 @@ export interface RepoManifest {
   truncated: boolean
 }
 
+/** An import queues board cards — nothing lands on the canvas until the
+ *  Doop Agent finishes each one. `rejected` lists selections the server no
+ *  longer finds in the repo manifest. */
 export interface GithubImportResult {
-  frames: Frame[]
-  failures: { route: string; error: string }[]
+  cards: string[]
+  rejected: string[]
 }
 
 export interface DiscoveredPage {
@@ -182,6 +185,15 @@ export const api = {
   /* owner-only: what the share link grants people who aren't invited */
   setLinkAccess: (id: string, linkAccess: 'edit' | 'none') =>
     req('/api/canvases/' + id, { method: 'PATCH', body: JSON.stringify({ linkAccess }) }),
+  /* community gallery: owner-only listing, open browsing and copying */
+  publishCanvas: (id: string, listing: { description: string; category: CommunityCategory }) =>
+    req<Pick<Canvas, 'publishedAt' | 'description' | 'category'>>(`/api/canvases/${id}/publish`, {
+      method: 'PUT',
+      body: JSON.stringify(listing),
+    }),
+  unpublishCanvas: (id: string) => req(`/api/canvases/${id}/publish`, { method: 'DELETE' }),
+  listCommunity: () => req<CommunityItem[]>('/api/community'),
+  copyCommunityCanvas: (id: string) => req<Canvas>(`/api/community/${id}/copy`, { method: 'POST' }),
   /* collaborators: the owner plus invited members */
   listMembers: (canvasId: string) => req<CanvasMember[]>(`/api/canvases/${canvasId}/members`),
   inviteMember: (canvasId: string, email: string) =>
@@ -295,6 +307,8 @@ export const api = {
     req(`/api/canvases/${canvasId}/cards/${cardId}/retry`, { method: 'POST' }),
   addComment: (frameId: string, input: { selector: string; snippet: string; text: string }) =>
     req(`/api/frames/${frameId}/comments`, { method: 'POST', body: JSON.stringify(input) }),
+  replyComment: (commentId: string, text: string) =>
+    req(`/api/comments/${commentId}/replies`, { method: 'POST', body: JSON.stringify({ text }) }),
   resolveComment: (commentId: string) => req(`/api/comments/${commentId}/resolve`, { method: 'POST' }),
   retryComment: (commentId: string) => req(`/api/comments/${commentId}/retry`, { method: 'POST' }),
   retryTaskFeedback: (feedbackId: string) => req(`/api/feedback/${feedbackId}/retry`, { method: 'POST' }),

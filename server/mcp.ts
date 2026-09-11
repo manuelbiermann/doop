@@ -10,12 +10,12 @@ import { auth, getUserName, isBanned, PUBLIC_ORIGIN } from './auth.ts'
 import { capture, captureThrottled } from './analytics.ts'
 import { renderFrame } from './screenshot.ts'
 import { DOOP_GUIDE, GUIDE_TOPICS } from './guide.ts'
-import { getStyleRecipe, STYLE_RECIPES } from './recipes.ts'
 import { describeInspiration, INSPIRATION_USAGE_NOTE, searchInspiration } from './inspiration.ts'
 import { ESCAPED_HTML_NOTE, looksEscapedHtml } from './escapedHtml.ts'
 import { describeSyncFlow, getSyncFlow } from './ingest.ts'
 import * as assets from './assets.ts'
 import * as imageSearch from './imageSearch.ts'
+import * as backgrounds from './backgrounds.ts'
 import { viewWebsite } from './website.ts'
 import { createImportedWebpageFrame } from './webpageImport.ts'
 import { normalizeImportUrl } from './importer.ts'
@@ -31,9 +31,10 @@ You MUST call get_guide({ topic: "doop-instructions" }) once before using other 
 - Creating: create_frame, then stream the design with append_frame_html one complete section at a time (~1–4 KB chunks; start=true on the first, done=true on the last). Each chunk renders the moment it arrives — viewers watch you work.
 - Review: after every create or significant edit you MUST call get_frame_screenshot and fix what looks wrong before moving on.
 - Small edits: edit_frame_html (exact find/replace — the change morphs into the rendered frame in place). Full redesigns: set_frame_html or a new stream. Rename/move/resize: update_frame.
-- Images: real imagery makes designs. search_images finds stock photos (you SEE thumbnails and pick), search_icons finds 200k+ UI icons as hotlinkable SVGs, search_logos finds real company logos by brand name or domain, upload_asset stores your own file (remote file → source_url; local file → local_file=true, returns a curl command) and returns a permanent URL. Never inline images as data: URIs.
+- Images: real imagery makes designs. search_images finds stock photos (you SEE thumbnails and pick), search_icons finds 200k+ UI icons as hotlinkable SVGs, search_logos finds real company logos by brand name or domain — call it once per brand BEFORE writing any logo wall, integration row, press bar or testimonial, and never ship a placeholder tile, "LOGO" text or an invented wordmark in its place, list_backgrounds shows a page of curated hero/section/bento backgrounds (glows, grainy meshes, aurora, painterly scenes) as thumbnails — browse it when a section wants atmosphere rather than defaulting to a flat CSS gradient, judge by eye whether one fits the frame, and draw your own when none does, upload_asset stores your own file (remote file → source_url; local file → local_file=true, returns a curl command) and returns a permanent URL. Never inline images as data: URIs.
 - Websites: when a request names an existing site or URL — a redesign of it, or "like acme.com" — call import_webpage FIRST so an editable HTML snapshot lands on the canvas. Leave that source frame unchanged and design in a separate frame. view_website is only for read-only inspection when the page should not be added. If Doop cannot capture the site, do not retry with view_website because it uses the same capture path. Use your own browser or web tool and work only from content you actually observe; if that is unavailable, ask the user for screenshots or an HTML export rather than inventing content.
 - Feedback: humans reply to your tasks; their notes arrive inside your tool results as HUMAN FEEDBACK blocks — address them before continuing.
+- Comments: call get_comments to read element-pinned comments and replies on a canvas, optionally filtered by frame. This does not claim feedback or resolve comments.
 - Guidelines: canvases can carry named style guides (brand rules, style recipes). get_canvas lists them with one-line summaries — read the relevant ones with get_guidelines BEFORE designing and follow them.
 - Memory: canvases can also carry pinned style references — exemplar designs humans marked as "more like this". get_canvas lists them; read the relevant one with get_reference and match its look. When your human gives you design feedback in conversation and you address it, record it with save_decision so the canvas remembers their taste.`
 
@@ -212,35 +213,15 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
   )
 
   server.registerTool(
-    'get_style_recipe',
-    {
-      title: 'Get style recipe',
-      description:
-        "Fetch one of the built-in style recipes — complete, executable style directions (mood north star, palette with roles, type pairing, signature moves) distilled from real gallery exemplars. The agent guide's design-brief ritual lists the menu; fetch the closest match for your category before writing a brief, then ADAPT it to the brand rather than copying it verbatim.",
-      inputSchema: {
-        name: z
-          .enum(STYLE_RECIPES.map((r) => r.name) as [string, ...string[]])
-          .describe('Recipe slug from the menu in the agent guide'),
-        canvas_id: z.string().optional().describe('The canvas you are designing on (lets human feedback reach you)'),
-        agent_name: agentName,
-      },
-    },
-    async ({ name, canvas_id, agent_name }) => {
-      const recipe = getStyleRecipe(name)
-      if (!recipe) return err(`no recipe named "${name}"`)
-      const result = text({ ok: true, name: recipe.name, category: recipe.category, recipe: recipe.markdown })
-      return canvas_id ? withFeedback(result, canvas_id, actorFrom(agent_name)) : result
-    },
-  )
-
-  server.registerTool(
     'search_inspiration',
     {
       title: 'Search design inspiration',
       description:
-        'Search a curated gallery of real, well-designed live websites by category and SEE thumbnails of each, with pre-distilled style facts (one-line mood north star, named palette, fonts). Use it while writing a design brief — especially for landing pages — when no built-in recipe fits the category, or alongside one: query the category plus the page type ("law firm landing page", "dark fintech dashboard"). Adapt what you see into the brief and name the exemplars; never embed these screenshots or copy an identity.',
+        'Search a curated gallery of real, well-designed live websites by category and SEE thumbnails of each, with pre-distilled style facts (one-line mood north star, named palette, fonts). Call it FIRST when writing a design brief — it is the required inspiration step, especially for landing pages: query the page archetype plus the register you want ("law firm landing page, editorial", "dark fintech dashboard"), not just the product noun. Study the thumbnails, pick the ONE exemplar that fits the brief best and follow it — do not blend several — and name it in the brief. Do not embed these screenshots in a frame.',
       inputSchema: {
-        query: z.string().describe('Category + page type, e.g. "grocery delivery landing page"'),
+        query: z
+          .string()
+          .describe('Page archetype + register, e.g. "grocery delivery landing page, warm", "dark fintech dashboard"'),
         count: z.number().min(1).max(6).optional().describe('Exemplars to return, default 4'),
         canvas_id: z.string().optional().describe('The canvas you are designing on (lets human feedback reach you)'),
         agent_name: agentName,
@@ -569,6 +550,35 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
   )
 
   server.registerTool(
+    'get_comments',
+    {
+      description:
+        'Read element-pinned comments and replies on a canvas, newest first, including author, text, frame, CSS selector, HTML snippet, parentId thread links, and claim/failure/resolution metadata. Includes resolved comments by default so complete conversations remain readable; set include_resolved to false for unresolved comments only. Returns the retained comment history (up to 100 entries per canvas), not an archive. Reading does not claim feedback or comments, or mark them resolved.',
+      annotations: { readOnlyHint: true },
+      inputSchema: {
+        canvas_id: z.string(),
+        frame_id: z.string().optional().describe('Only comments on this frame; it must belong to the canvas.'),
+        include_resolved: z.boolean().default(true).describe('Include resolved comments and replies. Default true.'),
+        agent_name: agentName.optional(),
+      },
+    },
+    async ({ canvas_id, frame_id, include_resolved, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      if (frame_id !== undefined) {
+        const frame = frameFor(frame_id)
+        if (!frame || frame.canvasId !== canvas_id) return noFrame(frame_id)
+      }
+      arrive(canvas_id, agent_name)
+      const comments = actions
+        .getComments(canvas_id)
+        .filter((comment) => frame_id === undefined || comment.frameId === frame_id)
+        .filter((comment) => include_resolved || comment.resolvedAt === undefined)
+      // Deliberately omit withFeedback: inspecting comments must not claim work.
+      return text(comments)
+    },
+  )
+
+  server.registerTool(
     'get_feedback',
     {
       description:
@@ -839,6 +849,62 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
   )
 
   server.registerTool(
+    'list_backgrounds',
+    {
+      title: 'List backgrounds',
+      description:
+        'Browse a curated library of premium backgrounds for hero sections, section bands and bento tiles — soft glows, grainy meshes, aurora ribbons, neon, painterly landscapes — as a page of thumbnails you look at, each with palette hexes and a ready-to-paste CSS line that includes a legibility scrim. Reach for it when a hero or full-bleed section wants atmosphere, depth or a focal glow; a quiet typographic design can stay flat, but a default two-stop gradient is rarely right. Filter by tone (light/dark — match your copy color), slot and style; an optional query ("warm sunset", "dark teal") only reorders. Then decide like a designer: does one of these genuinely fit the frame\'s style and palette? If yes, use it and put the copy in its text_zone. If not, call again with a different filter, or draw the background yourself.',
+      inputSchema: {
+        query: z
+          .string()
+          .optional()
+          .describe('Mood / palette words to put first, e.g. "warm sunset glow" — reorders, never filters'),
+        tone: z
+          .enum(backgrounds.BACKGROUND_TONES)
+          .optional()
+          .describe('light = dark copy on it, dark = light copy on it'),
+        style: z.enum(backgrounds.BACKGROUND_STYLES).optional().describe('Restrict to one look'),
+        slot: z
+          .enum(backgrounds.BACKGROUND_SLOTS)
+          .optional()
+          .describe('Where it goes: hero, section band, or card/bento tile'),
+        count: z.number().min(1).max(24).optional().describe('Thumbnails to return, default 12'),
+        canvas_id: z.string().optional().describe('The canvas you are designing on (lets human feedback reach you)'),
+        agent_name: agentName,
+      },
+    },
+    async ({ query, tone, style, slot, count, canvas_id, agent_name }) => {
+      if (!backgrounds.backgroundsEnabled())
+        return err(
+          'the background library is empty on this server — draw the background as CSS (layered radial-gradients with a grain overlay) instead',
+        )
+      try {
+        const listing = backgrounds.browseBackgrounds({ query, tone, style, slot, count }, PUBLIC_ORIGIN)
+        const { results } = listing
+        if (results.length === 0)
+          return text({
+            ok: true,
+            backgrounds: [],
+            note: 'No backgrounds match the tone/style/slot filters you set — drop one and call again.',
+          })
+        const thumbs = await Promise.all(results.map((r) => backgrounds.fetchThumb(r.id)))
+        type ResultBlock = { type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }
+        const content: ResultBlock[] = [{ type: 'text' as const, text: backgrounds.listHeadline(listing, query) }]
+        results.forEach((r, i) => {
+          const thumb = thumbs[i]
+          if (thumb) content.push({ type: 'image' as const, data: thumb.data, mimeType: thumb.mime })
+          content.push({ type: 'text' as const, text: backgrounds.describeBackground(r, i) })
+        })
+        content.push({ type: 'text' as const, text: backgrounds.BACKGROUND_USAGE_NOTE })
+        const result = { content }
+        return canvas_id ? withFeedback(result, canvas_id, actorFrom(agent_name)) : result
+      } catch (e) {
+        return err(e instanceof Error ? e.message : 'background search failed')
+      }
+    },
+  )
+
+  server.registerTool(
     'search_icons',
     {
       title: 'Search icons',
@@ -893,7 +959,7 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
           return text({
             ok: true,
             logos: [],
-            note: `No logo found for "${query}" — retry with the company's exact domain (e.g. "acme.io"), or ask your human for a logo file to upload_asset.`,
+            note: `No logo found for "${query}" — retry with the company's exact domain (e.g. "acme.io"). If that also fails, search a different real brand instead of drawing a placeholder, or ask your human for a logo file to upload_asset.`,
           })
         type ResultBlock = { type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }
         const content: ResultBlock[] = [{ type: 'text' as const, text: `Logo results for "${query}":` }]
@@ -1249,8 +1315,9 @@ export async function handleMcpRequest(req: Request, res: Response) {
   const server = buildMcpServer(owner, session.userId ?? undefined)
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined })
   res.on('close', () => {
-    transport.close()
-    server.close()
+    /* the client is gone; there is nobody left to report a close failure to */
+    void transport.close()
+    void server.close()
   })
   try {
     await server.connect(transport)

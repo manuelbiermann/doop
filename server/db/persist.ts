@@ -6,6 +6,7 @@ import { db } from './index.ts'
 import * as t from './schema.ts'
 import { extractAssetIds } from '../assets.ts'
 import { roleByAgentName } from '../../shared/agents.ts'
+import { isCommunityCategory } from '../../shared/types.ts'
 import type {
   ActivityItem,
   AgentTask,
@@ -16,6 +17,8 @@ import type {
   GuidelineDoc,
   MemoryProposal,
   MemoryReference,
+  RepoCardKind,
+  RepoCardPayload,
   TaskFeedback,
 } from '../../shared/types.ts'
 
@@ -29,22 +32,26 @@ function swallow(p: Promise<unknown>) {
   p.catch((err) => console.error('[db] write failed', err))
 }
 
+/** every mutable canvas column, so insert and upsert can't drift apart */
+function canvasColumns(c: Canvas) {
+  return {
+    name: c.name,
+    ownerId: c.ownerId ?? null,
+    linkAccess: c.linkAccess ?? null,
+    publishedAt: c.publishedAt ?? null,
+    description: c.description ?? null,
+    category: c.category ?? null,
+    copyCount: c.copyCount ?? 0,
+    updatedAt: c.updatedAt,
+  }
+}
+
 export function saveCanvas(c: Canvas) {
   swallow(
     db
       .insert(t.canvases)
-      .values({
-        id: c.id,
-        name: c.name,
-        ownerId: c.ownerId ?? null,
-        linkAccess: c.linkAccess ?? null,
-        createdAt: c.createdAt,
-        updatedAt: c.updatedAt,
-      })
-      .onConflictDoUpdate({
-        target: t.canvases.id,
-        set: { name: c.name, ownerId: c.ownerId ?? null, linkAccess: c.linkAccess ?? null, updatedAt: c.updatedAt },
-      }),
+      .values({ id: c.id, ...canvasColumns(c), createdAt: c.createdAt })
+      .onConflictDoUpdate({ target: t.canvases.id, set: canvasColumns(c) }),
   )
 }
 
@@ -52,14 +59,7 @@ export function saveCanvas(c: Canvas) {
  * duplication must not report success until every copied row is durable. */
 export async function saveCanvasCopy(c: Canvas): Promise<void> {
   await db.transaction(async (tx) => {
-    await tx.insert(t.canvases).values({
-      id: c.id,
-      name: c.name,
-      ownerId: c.ownerId ?? null,
-      linkAccess: c.linkAccess ?? null,
-      createdAt: c.createdAt,
-      updatedAt: c.updatedAt,
-    })
+    await tx.insert(t.canvases).values({ id: c.id, ...canvasColumns(c), createdAt: c.createdAt })
 
     if (c.frames.length) {
       await tx.insert(t.frames).values(
@@ -358,6 +358,17 @@ export function deleteFrame(frameId: string) {
   swallow(db.delete(t.assetRefs).where(eq(t.assetRefs.frameId, frameId)))
 }
 
+/** A structured card's kind + payload, or nothing when the row is a prompt
+ *  card or its payload no longer parses (the card then reads as a plain one). */
+function repoCardFields(kind: string | null, payload: string | null): Pick<AgentTask, 'kind' | 'payload'> {
+  if (!kind || !payload) return {}
+  try {
+    return { kind: kind as RepoCardKind, payload: JSON.parse(payload) as RepoCardPayload }
+  } catch {
+    return {}
+  }
+}
+
 export function saveTask(canvasId: string, task: AgentTask) {
   const row = {
     id: task.id,
@@ -377,6 +388,8 @@ export function saveTask(canvasId: string, task: AgentTask) {
     pipeline: task.pipeline?.join(',') ?? null,
     stage: task.stage ?? null,
     attachments: task.attachments?.join(',') ?? null,
+    kind: task.kind ?? null,
+    payload: task.payload ? JSON.stringify(task.payload) : null,
   }
   swallow(
     db
@@ -452,6 +465,7 @@ export function saveComment(c: ElementComment) {
     failureReason: c.failureReason ?? null,
     resolvedBy: c.resolvedBy ?? null,
     resolvedAt: c.resolvedAt ?? null,
+    parentId: c.parentId ?? null,
   }
   swallow(
     db
@@ -547,6 +561,10 @@ export async function hydrate(): Promise<Hydrated> {
     name: c.name,
     ownerId: c.ownerId ?? undefined,
     linkAccess: c.linkAccess === 'edit' ? 'edit' : undefined,
+    ...(c.publishedAt != null ? { publishedAt: c.publishedAt } : {}),
+    ...(c.description ? { description: c.description } : {}),
+    ...(isCommunityCategory(c.category) ? { category: c.category } : {}),
+    ...(c.copyCount ? { copyCount: c.copyCount } : {}),
     createdAt: c.createdAt,
     updatedAt: c.updatedAt,
     frames: [],
@@ -591,11 +609,14 @@ export async function hydrate(): Promise<Hydrated> {
   const tasks = new Map<string, AgentTask[]>()
   for (const row of taskRows) {
     const list = tasks.get(row.canvasId) ?? []
-    if (list.length >= LOG_CAP) continue
     /* A task still open across a restart belongs to an agent that's gone.
        Ordinary status tasks close; claimed board cards pause in a visible
        failed state and require a human retry. */
     const isOpenCard = row.queuedBy != null && row.endedAt == null
+    /* the cap bounds history, never open work: an unfinished card older than
+       the newest hundred rows still belongs on the board (same rule as
+       actions.trimTaskLog keeps in memory) */
+    if (list.length >= LOG_CAP && !isOpenCard) continue
     const endedAt = isOpenCard ? undefined : (row.endedAt ?? now)
     const interruptedCard = isOpenCard && !!row.agentName
     const failedAt = row.failedAt ?? (interruptedCard ? now : undefined)
@@ -621,6 +642,7 @@ export async function hydrate(): Promise<Hydrated> {
       ...(row.pipeline ? { pipeline: row.pipeline.split(',').filter(Boolean) } : {}),
       ...(row.stage != null ? { stage: row.stage } : {}),
       ...(row.attachments ? { attachments: row.attachments.split(',').filter(Boolean) } : {}),
+      ...repoCardFields(row.kind, row.payload),
     })
     tasks.set(row.canvasId, list)
   }
@@ -684,6 +706,7 @@ export async function hydrate(): Promise<Hydrated> {
       ...(failureReason !== undefined ? { failureReason } : {}),
       ...(row.resolvedBy != null ? { resolvedBy: row.resolvedBy } : {}),
       ...(row.resolvedAt != null ? { resolvedAt: row.resolvedAt } : {}),
+      ...(row.parentId != null ? { parentId: row.parentId } : {}),
     })
     comments.set(row.canvasId, list)
   }

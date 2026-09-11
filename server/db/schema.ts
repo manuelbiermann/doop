@@ -1,4 +1,4 @@
-import { pgTable, text, doublePrecision, bigint, boolean, integer, index, primaryKey } from 'drizzle-orm/pg-core'
+import { pgTable, text, doublePrecision, bigint, boolean, integer, index, primaryKey, jsonb } from 'drizzle-orm/pg-core'
 
 /**
  * One Postgres-dialect schema for every environment: PGlite (embedded, file
@@ -14,6 +14,15 @@ export const canvases = pgTable('canvases', {
   ownerId: text('owner_id'),
   /** 'edit' | 'none'; null = 'none' (private — link sharing is opt-in) */
   linkAccess: text('link_access'),
+  /** set when the owner has listed this canvas in the community gallery;
+   *  null = private to its collaborators. Publishing grants read-only
+   *  previews and copies, never access to the canvas itself. */
+  publishedAt: bigint('published_at', { mode: 'number' }),
+  /** gallery blurb and category — meaningful only while published */
+  description: text('description'),
+  category: text('category'),
+  /** how many times the gallery has copied this canvas — the "trending" signal */
+  copyCount: integer('copy_count').notNull().default(0),
   createdAt: bigint('created_at', { mode: 'number' }).notNull(),
   updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
 })
@@ -156,6 +165,10 @@ export const tasks = pgTable(
     attachments: text('attachments'),
     /** account id of the human who queued the card — picks the model credential */
     queuedByUserId: text('queued_by_user_id'),
+    /** structured cards ('sketch', 'design-system'); null for prompt cards */
+    kind: text('kind'),
+    /** JSON payload of a structured card — what its runner needs, never a secret */
+    payload: text('payload'),
   },
   (t) => [index('tasks_canvas_idx').on(t.canvasId)],
 )
@@ -201,6 +214,7 @@ export const comments = pgTable(
     failureReason: text('failure_reason'),
     resolvedBy: text('resolved_by'),
     resolvedAt: bigint('resolved_at', { mode: 'number' }),
+    parentId: text('parent_id'),
   },
   (t) => [index('comments_canvas_idx').on(t.canvasId)],
 )
@@ -374,4 +388,26 @@ export const modelAccounts = pgTable('model_accounts', {
   model: text('model'),
   connectedAt: bigint('connected_at', { mode: 'number' }).notNull(),
   updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
+})
+
+/* The curated background library behind search_backgrounds
+   (server/backgrounds.ts). Bytes live in object storage under bg/<id>.webp
+   and bg/<id>-t.webp; this row is everything the search ranks on. */
+export const backgrounds = pgTable('backgrounds', {
+  id: text('id').primaryKey(),
+  /** sha1 of the uploaded source file — re-uploads of the same image are skipped */
+  source: text('source').notNull(),
+  width: integer('width').notNull(),
+  height: integer('height').notNull(),
+  tone: text('tone').notNull(),
+  style: text('style').notNull(),
+  avgColor: text('avg_color').notNull(),
+  palette: jsonb('palette').$type<string[]>().notNull(),
+  tags: jsonb('tags').$type<string[]>().notNull(),
+  slots: jsonb('slots').$type<string[]>().notNull(),
+  textZone: text('text_zone').notNull(),
+  description: text('description').notNull(),
+  /** off = kept but hidden from search; new uploads without tags start off */
+  enabled: boolean('enabled').notNull().default(true),
+  createdAt: bigint('created_at', { mode: 'number' }).notNull(),
 })
