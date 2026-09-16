@@ -15,11 +15,14 @@ import { ESCAPED_HTML_NOTE, looksEscapedHtml } from './escapedHtml.ts'
 import { describeSyncFlow, getSyncFlow } from './ingest.ts'
 import * as assets from './assets.ts'
 import * as imageSearch from './imageSearch.ts'
+import * as imageGen from './imageGen.ts'
 import * as backgrounds from './backgrounds.ts'
 import { viewWebsite } from './website.ts'
 import { createImportedWebpageFrame } from './webpageImport.ts'
 import { normalizeImportUrl } from './importer.ts'
 import { websiteAccessErrorMessage } from './websiteAccess.ts'
+import { mentionedRole } from '../shared/agents.ts'
+import * as allowance from './allowance.ts'
 
 const INSTRUCTIONS = `Doop is a shared multiplayer design canvas: humans and AI agents design together in real time. Canvases contain frames — artboards that render complete HTML documents live for everyone viewing.
 
@@ -31,10 +34,10 @@ You MUST call get_guide({ topic: "doop-instructions" }) once before using other 
 - Creating: create_frame, then stream the design with append_frame_html one complete section at a time (~1–4 KB chunks; start=true on the first, done=true on the last). Each chunk renders the moment it arrives — viewers watch you work.
 - Review: after every create or significant edit you MUST call get_frame_screenshot and fix what looks wrong before moving on.
 - Small edits: edit_frame_html (exact find/replace — the change morphs into the rendered frame in place). Full redesigns: set_frame_html or a new stream. Rename/move/resize: update_frame.
-- Images: real imagery makes designs. search_images finds stock photos (you SEE thumbnails and pick), search_icons finds 200k+ UI icons as hotlinkable SVGs, search_logos finds real company logos by brand name or domain — call it once per brand BEFORE writing any logo wall, integration row, press bar or testimonial, and never ship a placeholder tile, "LOGO" text or an invented wordmark in its place, list_backgrounds shows a page of curated hero/section/bento backgrounds (glows, grainy meshes, aurora, painterly scenes) as thumbnails — browse it when a section wants atmosphere rather than defaulting to a flat CSS gradient, judge by eye whether one fits the frame, and draw your own when none does, upload_asset stores your own file (remote file → source_url; local file → local_file=true, returns a curl command) and returns a permanent URL. Never inline images as data: URIs.
+- Images: real imagery makes designs. search_images finds stock photos (you SEE thumbnails and pick), search_icons finds 200k+ UI icons as hotlinkable SVGs, search_logos finds real company logos by brand name or domain — call it once per brand BEFORE writing any logo wall, integration row, press bar or testimonial, and never ship a placeholder tile, "LOGO" text or an invented wordmark in its place, list_backgrounds shows a page of curated hero/section/bento backgrounds (glows, grainy meshes, aurora, painterly scenes) as thumbnails — browse it when a section wants atmosphere rather than defaulting to a flat CSS gradient, judge by eye whether one fits the frame, and draw your own when none does, upload_asset stores your own file (remote file → source_url; local file → local_file=true, returns a curl command) and returns a permanent URL. generate_image makes a new image from a prompt (illustration, product render, brand-specific hero art, a mark or cut-out that stock cannot supply) and stores it as a permanent asset — reach for it when search_images cannot deliver the exact visual, or when the human asks for a generated image; it costs the human money or quota, so one considered prompt beats five drafts. Never inline images as data: URIs.
 - Websites: when a request names an existing site or URL — a redesign of it, or "like acme.com" — call import_webpage FIRST so an editable HTML snapshot lands on the canvas. Leave that source frame unchanged and design in a separate frame. view_website is only for read-only inspection when the page should not be added. If Doop cannot capture the site, do not retry with view_website because it uses the same capture path. Use your own browser or web tool and work only from content you actually observe; if that is unavailable, ask the user for screenshots or an HTML export rather than inventing content.
 - Feedback: humans reply to your tasks; their notes arrive inside your tool results as HUMAN FEEDBACK blocks — address them before continuing.
-- Comments: call get_comments to read element-pinned comments and replies on a canvas, optionally filtered by frame. This does not claim feedback or resolve comments.
+- Comments: call get_comments to read element-pinned comments and replies on a canvas, optionally filtered by frame; reply_to_comment answers a thread and resolve_comment closes it. Reading does not claim feedback or comments. A reply that @mentions a resident role is metered like a comment left in the browser.
 - Guidelines: canvases can carry named style guides (brand rules, style recipes). get_canvas lists them with one-line summaries — read the relevant ones with get_guidelines BEFORE designing and follow them.
 - Memory: canvases can also carry pinned style references — exemplar designs humans marked as "more like this". get_canvas lists them; read the relevant one with get_reference and match its look. When your human gives you design feedback in conversation and you address it, record it with save_decision so the canvas remembers their taste.`
 
@@ -133,6 +136,11 @@ const UPLOADS_PER_MIN = 15
 const searchHits = new Map<string, number[]>()
 const SEARCHES_PER_MIN = 12
 
+/* generation spends the payer's subscription quota or money — keep a burst
+   of retries from draining it */
+const generateHits = new Map<string, number[]>()
+const GENERATIONS_PER_MIN = 6
+
 /* importing writes a potentially large HTML frame, so keep it at the same
    conservative per-user rate as the browser UI's import endpoint */
 const importHits = new Map<string, number[]>()
@@ -192,6 +200,7 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
   }
   const noCanvas = (id: string) => err(`no canvas with id ${id} accessible to this account`)
   const noFrame = (id: string) => err(`no frame with id ${id} accessible to this account`)
+  const noComment = (id: string) => err(`no comment with id ${id} on this canvas`)
   /* Reads count as arrival: presence (and with it every "your agent is
      connected" confirmation in the UI) must appear on an agent's FIRST
      canvas-scoped call, not only once it mutates something. */
@@ -579,6 +588,84 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
   )
 
   server.registerTool(
+    'reply_to_comment',
+    {
+      description:
+        'Reply inside an element-comment thread on a canvas. The reply inherits the root comment’s element anchor, so an @mention in it gives the resident agent the same anchor the conversation is about. Writing does not resolve the thread — read the request with get_comments, make the change, then close it with resolve_comment. If the text @mentions a resident role (e.g. "@Doop"), it counts as a new resident task against the account’s meter, exactly like a comment left in the browser.',
+      inputSchema: {
+        canvas_id: z.string(),
+        comment_id: z.string().describe('The root comment or any reply in the thread (from get_comments)'),
+        text: z.string().describe('The reply text. Trimmed; empty replies are rejected.'),
+        agent_name: agentName,
+      },
+    },
+    async ({ canvas_id, comment_id, text: body, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      const found = actions.findComment(comment_id)
+      if (!found || found.canvasId !== canvas_id) return noComment(comment_id)
+      if (!body.trim() || !actions.openThread(comment_id)) return err('thread resolved or empty text')
+      const actor = actorFrom(agent_name)
+      arrive(canvas_id, agent_name)
+      /* A reply that @mentions a resident agent is a new command to the team,
+         metered like a card; plain replies stay free. Mirrors the REST reply
+         route so the meter is spent exactly once either way. */
+      let gate: Awaited<ReturnType<typeof allowance.consumeResidentTask>> | undefined
+      if (mentionedRole(body) && ownerId) {
+        gate = await allowance.consumeResidentTask(ownerId)
+        if (!gate.ok)
+          return err(
+            `resident task limit reached (${gate.used}/${gate.limit}) — connect a model account or retry later`,
+          )
+      }
+      const reply = actions.replyToComment(comment_id, body, actor.name, undefined, 'agent')
+      if (!reply) {
+        /* the thread closed while the meter was being written: give the task back */
+        if (gate && ownerId) {
+          await allowance
+            .refundResidentTask(gate, ownerId)
+            .catch((e) => console.error(`[mcp] could not refund a resident task for ${ownerId}:`, e))
+        }
+        return err('thread resolved meanwhile')
+      }
+      return withFeedback(text(reply), canvas_id, actor)
+    },
+  )
+
+  server.registerTool(
+    'resolve_comment',
+    {
+      description:
+        'Resolve an element-comment thread on a canvas, marking the request addressed. Resolving a root comment closes its whole thread; resolving a reply closes only that reply. When the thread was an @mention of a resident agent, resolving it also records the exchange as a design decision in the canvas Memory (plain human-to-human notes are not). This does not claim task feedback — use get_feedback for that.',
+      inputSchema: {
+        canvas_id: z.string(),
+        comment_id: z.string().describe('The root comment or a reply (from get_comments)'),
+        agent_name: agentName,
+      },
+    },
+    async ({ canvas_id, comment_id, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      const found = actions.findComment(comment_id)
+      if (!found || found.canvasId !== canvas_id) return noComment(comment_id)
+      const actor = actorFrom(agent_name)
+      arrive(canvas_id, agent_name)
+      const alreadyResolved = found.resolvedAt !== undefined
+      const resolved = actions.resolveComment(comment_id, actor.name)
+      if (!resolved) return noComment(comment_id)
+      return withFeedback(
+        text({
+          ok: true,
+          id: resolved.id,
+          alreadyResolved,
+          resolvedBy: resolved.resolvedBy,
+          resolvedAt: resolved.resolvedAt ? new Date(resolved.resolvedAt).toISOString() : undefined,
+        }),
+        canvas_id,
+        actor,
+      )
+    },
+  )
+
+  server.registerTool(
     'get_feedback',
     {
       description:
@@ -784,6 +871,74 @@ export function buildMcpServer(owner?: string, ownerId?: string): McpServer {
         return withFeedback(result, canvas_id, actorFrom(agent_name))
       } catch (e) {
         return err(e instanceof Error ? e.message : 'upload failed')
+      }
+    },
+  )
+
+  server.registerTool(
+    'generate_image',
+    {
+      title: 'Generate an image with AI',
+      description:
+        "Generate an image from a text prompt and store it as a permanent asset on this origin — returns the URL to embed plus a preview you can look at. Use it for visuals stock search cannot supply: brand-specific illustration, a product render, a mascot, abstract hero art in the frame's exact palette. Prefer search_images for ordinary photography. It runs on the connecting human's connected ChatGPT subscription or OpenAI key (else the server's key) and costs them quota or money, so write ONE considered prompt: subject, style, composition, palette hexes, lighting, what to leave out. Generation takes 20–60 seconds. ONLY generate when the design genuinely needs it or the human asked.",
+      inputSchema: {
+        prompt: z.string().describe('What to draw: subject, style, composition, palette, lighting, mood'),
+        aspect: z
+          .enum(imageGen.IMAGE_ASPECTS)
+          .optional()
+          .describe('square 1024×1024 (default), landscape 1536×1024, portrait 1024×1536 — match the slot'),
+        quality: z.enum(imageGen.IMAGE_QUALITIES).optional().describe('low is fast and cheap; default medium'),
+        canvas_id: z.string().describe('The canvas this image belongs to'),
+        agent_name: agentName,
+      },
+    },
+    async ({ prompt, aspect, quality, canvas_id, agent_name }) => {
+      if (!canvasFor(canvas_id)) return noCanvas(canvas_id)
+      const now = Date.now()
+      const limitKey = ownerId ?? agent_name
+      const hits = (generateHits.get(limitKey) ?? []).filter((t) => now - t < 60_000)
+      if (hits.length >= GENERATIONS_PER_MIN) return err('image generation rate limit — wait a minute')
+      hits.push(now)
+      generateHits.set(limitKey, hits)
+      try {
+        const image = await imageGen.generateImage(ownerId, { prompt, aspect, quality })
+        const asset = await assets.createAsset(image.buf, { canvasId: canvas_id, ownerId, uploadedBy: agent_name })
+        const url = `${PUBLIC_ORIGIN}/a/${asset.id}.${asset.ext}`
+        capture(ownerId ?? agent_name, 'image_generated', {
+          canvas_id,
+          aspect,
+          quality,
+          billed_to: image.billedTo,
+        })
+        const result = {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify(
+                {
+                  ok: true,
+                  url,
+                  width: image.width,
+                  height: image.height,
+                  mime: asset.mime,
+                  size_bytes: asset.size,
+                  billed_to: image.billedTo,
+                  usage: `<img src="${url}" alt="" style="object-fit: cover">`,
+                },
+                null,
+                2,
+              ),
+            },
+            { type: 'image' as const, data: image.preview.data, mimeType: image.preview.mime },
+            {
+              type: 'text' as const,
+              text: 'Preview above — judge it before embedding. If it misses, refine the prompt (say what was wrong) rather than regenerating blind. The URL is permanent and safe to reference in any frame.',
+            },
+          ],
+        }
+        return withFeedback(result, canvas_id, actorFrom(agent_name))
+      } catch (e) {
+        return err(e instanceof Error ? e.message : 'image generation failed')
       }
     },
   )
