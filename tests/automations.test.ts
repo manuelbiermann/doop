@@ -69,9 +69,9 @@ describe('normalize', () => {
       minute: 0,
       tz: 'UTC',
     })
-    /* the clock reads in the runner's locale: 16:00 or 4:00 PM */
+    /* the clock reads in the runner's locale: 16:00, 4:00 PM, or 4:00 pm */
     expect(describeSchedule(normalizeSchedule({ kind: 'weekly', weekday: 5, hour: 16, minute: 0 }))).toMatch(
-      /^Every Friday at (16:00|4:00 PM)$/,
+      /^Every Friday at (16:00|4:00 [Pp][Mm])$/,
     )
   })
 
