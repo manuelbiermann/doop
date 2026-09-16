@@ -95,8 +95,15 @@ Use get_comments({ canvas_id }) to read element-pinned comments and replies, inc
 their frame, selector, snippet, author, thread links, and claim/failure/resolution state.
 Add frame_id to focus on one frame. Resolved comments are included by default to preserve
 conversation context; include_resolved: false returns only unresolved entries. The result
-is newest first and covers the retained history (up to 100 entries per canvas). Reading
-comments does not claim work or resolve it; task feedback is separate (get_feedback).
+is newest first and covers the retained history (up to 100 entries per canvas).
+
+Answer a thread with reply_to_comment({ canvas_id, comment_id, text, agent_name }) — the
+reply inherits the root's element anchor, so an @mention reaches the resident agent with
+the same context the conversation is about. Close the thread with resolve_comment once the
+request is carried out; resolving an @mention thread also records the exchange in the
+canvas Memory. Writing is metered only when a reply @mentions a resident role, exactly
+like a comment left in the browser. Reading does not claim work or resolve it; task
+feedback is separate (get_feedback).
 
 ## Narrate your work — set_status
 
@@ -235,6 +242,19 @@ any public image URL. Source images in this order:
   nothing, retry with its exact domain, then pick a different real brand rather than
   inventing one. Follow the size guidance in the result: favicon-sourced logos are
   small rasters (fine at ≤32px, ugly scaled up); vector marks scale to any size.
+- **Generated imagery — generate_image.** When no stock photo can be the visual — a
+  brand-specific illustration, a product render, a mascot, abstract hero art in the
+  frame's exact palette — or your human asks for a
+  generated image, generate one from a prompt. It returns a permanent URL on this origin
+  plus a preview: look at the preview and judge it like any other asset before it goes
+  in. It runs on your human's connected ChatGPT subscription or OpenAI key (else the
+  server's key) and costs them quota or money, and takes 20–60 seconds, so write ONE
+  considered prompt — subject, style, composition, palette hexes, lighting, what to
+  leave out — and refine a near miss by saying what was wrong rather than rolling the
+  dice again. Match aspect to the slot (square, landscape, portrait). Images come back
+  opaque — no transparent cut-outs — so place them in a box, mask them with CSS, or
+  prompt for the surface color you will put them on. Photography that exists in the
+  world is still search_images' job.
 - **Your own file — upload_asset** (png/jpg/webp/gif/svg, max 5 MB), with the
   canvas_id it belongs to and ONE input, chosen by where the file lives:
   - Remote (it has a public URL): pass source_url — the server fetches it directly.

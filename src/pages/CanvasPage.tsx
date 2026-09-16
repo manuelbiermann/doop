@@ -12,7 +12,8 @@ import {
   type SyncKeyInfo,
 } from '../lib/api'
 import { navigate } from '../App'
-import { DoopMark, Logo } from '../components/Logo'
+import { DoopMark } from '../components/Logo'
+import { BarDivider, TopBar, TopBarHome, TopBarTitle } from '../components/TopBar'
 import { ensureTab } from '../lib/desktop'
 import { Stage } from '../components/Stage'
 import { Board } from '../components/Board'
@@ -28,7 +29,6 @@ import { LayersPanel, LayersRailToggle } from '../components/LayersPanel'
 import { Onboarding } from '../components/Onboarding'
 import { ShareModal } from '../components/ShareModal'
 import { PresentMode } from '../components/PresentMode'
-import { BrainIcon } from '../components/BrainIcon'
 import { getIdentity, setName } from '../lib/identity'
 import {
   copyFrames,
@@ -44,7 +44,15 @@ import { useIsMobile } from '../hooks/use-mobile'
 import { cn } from '@/lib/utils'
 import { Button } from '../components/ui/button'
 import { Sheet, SheetContent, SheetDescription, SheetTitle } from '../components/ui/sheet'
-import { GithubIcon, ImportIcon, MoreHorizontalIcon, PlayIcon, PulseIcon, SparkIcon } from '../components/ui/icons'
+import {
+  BrainIcon,
+  GithubIcon,
+  ImportIcon,
+  MoreHorizontalIcon,
+  PlayIcon,
+  PulseIcon,
+  SparkIcon,
+} from '../components/ui/icons'
 import { Badge } from '../components/ui/badge'
 import { Input } from '../components/ui/input'
 import { Field } from '../components/ui/field'
@@ -269,19 +277,9 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
           into the ••• sheet so the name and the view switch keep their room.
           Phone (< xs): two rows, the name on top, the switch and the actions
           below it, each at its natural width. */}
-      <div className="z-40 flex h-14 flex-none items-center gap-4 border-b border-line bg-surface px-4 max-md:gap-2.5 max-md:px-3 max-xs:h-[100px] max-xs:flex-wrap max-xs:content-center max-xs:gap-y-2 max-xs:py-2">
+      <TopBar>
         <div className="flex min-w-0 items-center gap-1.5 max-xs:basis-full">
-          <Tooltip label="All canvases" side="bottom" align="start">
-            <Button
-              variant="bare"
-              size="icon-sm"
-              className="size-9 hover:bg-paper-deep"
-              onClick={() => navigate('/')}
-              aria-label="All canvases"
-            >
-              <Logo className="size-6" />
-            </Button>
-          </Tooltip>
+          <TopBarHome label="All canvases" to="/" />
           <CanvasName />
           <Badge className="max-md:hidden" title="Canvas id — agents use this with the MCP tools">
             {canvasId}
@@ -407,7 +405,7 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
             </Button>
           </Tooltip>
         </div>
-      </div>
+      </TopBar>
 
       <div className="relative flex-1 overflow-hidden">
         {view === 'board' ? (
@@ -455,7 +453,7 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
                     setDecisionToast(null)
                   }}
                 >
-                  <BrainIcon size={17} />
+                  <BrainIcon width={17} height={17} />
                   <span>
                     <b className="block font-display text-[13px] font-semibold tracking-[-0.01em]">Saved to Memory</b>
                     <span className="mt-[1px] block text-[12px] leading-[1.4] text-ink-soft">{decisionToast}</span>
@@ -629,11 +627,6 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
       )}
     </div>
   )
-}
-
-/* hairline between the top bar's clusters: actions | presence | sharing */
-function BarDivider() {
-  return <span aria-hidden className="mx-1 h-[22px] w-px bg-line-soft" />
 }
 
 function ImportModal({
@@ -1551,30 +1544,17 @@ function GithubSection({
 }
 
 /* The canvas title doubles as its rename field. */
-const canvasNameCls = 'min-w-0 max-w-[240px] sm:min-w-[60px] sm:max-w-[320px]'
-
 function CanvasName() {
   const canvas = useStore((s) => s.canvas)
-  const [draft, setDraft] = useState<string | null>(null)
-  if (!canvas)
-    return <span className={cn(canvasNameCls, 'px-2 py-[5px] font-display text-[15px] font-semibold')}>…</span>
   return (
-    <Input
-      variant="title"
-      inputSize="sm"
-      className={cn(canvasNameCls, 'truncate max-xs:max-w-[calc(100vw-72px)]')}
-      value={draft ?? canvas.name}
-      size={Math.max(6, (draft ?? canvas.name).length)}
-      onFocus={() => setDraft(canvas.name)}
-      onChange={(e) => setDraft(e.target.value)}
-      onBlur={() => {
-        if (draft !== null && draft.trim() && draft !== canvas.name) {
-          api.renameCanvas(canvas.id, draft.trim()).catch(console.error)
-          useStore.getState().renameCanvasLocal(draft.trim())
-        }
-        setDraft(null)
+    <TopBarTitle
+      loading={!canvas}
+      value={canvas?.name ?? ''}
+      onCommit={(name) => {
+        if (!canvas) return
+        api.renameCanvas(canvas.id, name).catch(console.error)
+        useStore.getState().renameCanvasLocal(name)
       }}
-      onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
     />
   )
 }
