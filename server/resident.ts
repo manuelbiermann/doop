@@ -1,6 +1,6 @@
 import type Anthropic from '@anthropic-ai/sdk'
 import { store } from './store.ts'
-import { ModelAuthError, pickModel } from './agentModel.ts'
+import { ModelAuthError, ModelConfigurationError, ModelUnavailableError, pickModel } from './agentModel.ts'
 import { RESIDENT_TASK_LIMIT } from './allowance.ts'
 import * as actions from './actions.ts'
 import { inspectFrame, renderFrame } from './screenshot.ts'
@@ -16,7 +16,7 @@ import { viewWebsite, referencedUrls } from './website.ts'
 import { createImportedWebpageFrame, findImportedWebpageFrame } from './webpageImport.ts'
 import { DESIGN_BRIEF, DESIGN_QUALITY } from './guide.ts'
 import { describeInspiration, INSPIRATION_USAGE_NOTE, searchInspiration } from './inspiration.ts'
-import type { Frame } from '../shared/types.ts'
+import type { AgentTask, Frame } from '../shared/types.ts'
 import { websiteAccessErrorMessage } from './websiteAccess.ts'
 import { executeGuardedBatch } from './guardedBatch.ts'
 import { runRepoCards } from './githubRecon.ts'
@@ -109,7 +109,7 @@ Rules:
 - Call set_status when you start ("Fixing: …") and when your focus shifts. One line, under 80 chars, present tense. People watch this live.
 - Never leave a frame worse than you found it.
 - Reference sites: when a request names a site or URL — a redesign of it, or "like acme.com" — call import_webpage with as_reference=true FIRST so an editable HTML snapshot lands on the canvas, then call screenshot_frame on that imported source and design from what is actually there: its real copy, nav labels, product facts, and imagery direction. Leave the imported source unchanged and deliver your work in a separate frame. If importing or editing the snapshot itself is the requested deliverable, use as_reference=false. view_website is read-only; use it only when you need to inspect a live page without adding it to the canvas. A redesign that invents content is wrong even when it looks good. If automated access is blocked and there is no existing source frame or attached screenshot, stop and ask the user to attach screenshots; never approximate the site from guesses.
-- Real imagery: when a design calls for photography, use search_images (you see thumbnails — pick the one whose mood and palette fit) and embed its image_url with object-fit: cover and a real alt text. For a hero, section band or bento tile that wants atmosphere or a focal glow, list_backgrounds shows a page of the curated library as thumbnails (filter by tone; judge by eye which one fits the frame's style and palette, paste its css line, put copy in the text_zone); a quiet typographic design may be better on a flat surface, but never settle for a default two-stop gradient, and draw the background yourself when nothing in the library genuinely fits. For UI icons use search_icons and hotlink the SVG URL. For company logos (customer walls, integration rows, press bars, payment methods, testimonial cards) call search_logos once per brand BEFORE writing that section, and use real, recognizable brands — never a gray tile, "LOGO" text, initials or an invented wordmark. When the design needs a visual that stock cannot supply — brand-specific illustration, a product render, a mascot, abstract hero art in the exact palette — or the card asks for a generated image, call generate_image with ONE considered prompt (subject, style, composition, palette hexes, lighting, exclusions) and embed the returned url; it spends the requester's quota or money, so refine a near miss by prompt rather than regenerating blind. Never fake a photo with a gray box or a made-up URL; if search is unavailable, draw the visual as inline SVG/CSS.
+- Real imagery: when a design calls for photography, use search_images (you see thumbnails — pick the one whose mood and palette fit) and embed its image_url with object-fit: cover and a real alt text. For a hero, section band or bento tile that wants atmosphere or a focal glow, list_backgrounds shows a page of the curated library as thumbnails (filter by tone; judge by eye which one fits the frame's style and palette, paste its css line, put copy in the text_zone); a quiet typographic design may be better on a flat surface, but never settle for a default two-stop gradient, and draw the background yourself when nothing in the library genuinely fits. For UI icons use search_icons and hotlink the SVG URL. For company logos (customer walls, integration rows, press bars, payment methods, testimonial cards) call search_logos once per brand BEFORE writing that section, and use real, recognizable brands — never a gray tile, "LOGO" text, initials or an invented wordmark. When the design needs a visual that stock cannot supply — a full-bleed hero background in the frame's exact palette (a monochrome mountain range behind the product window, say), brand-specific illustration, a product render, a mascot — or the card asks for a generated image, call generate_image with ONE considered prompt (subject, style, composition, palette hexes, lighting, exclusions; for a hero background: aspect landscape, low contrast, and name the empty region where the copy or product window will sit) and embed the returned url with object-fit: cover and a legibility scrim over the copy; it spends the requester's quota or money, so refine a near miss by prompt rather than regenerating blind. Never fake a photo with a gray box or a made-up URL; if search is unavailable, draw the visual as inline SVG/CSS.
 - If a request is unclear or impossible (missing frame, contradictory ask), do the closest reasonable thing and say what you did in your final message.
 - Your final message should be one or two sentences: what you changed and where.
 
@@ -144,6 +144,9 @@ interface RunState {
   verifiedFrames: Set<string>
   rewriteDrafts: Map<string, string>
   blockedWebsiteAccess?: string
+  /** false = the model cannot see images: screenshots are skipped and the
+   *  visual-verification requirement does not apply to this run */
+  vision: boolean
   /** whose account pays for generated images: the run's payer, else the server key */
   payerId?: string
   /** images actually produced in this run — capped, since each one spends the payer's quota or money */
@@ -222,17 +225,19 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
      can still reach this point without a payable account — queued before the
      account was disconnected, or before metering tightened — and it must
      fail visibly with a fix, not crash on a key that was never meant to pay. */
+  const actor = actions.resolveActor({ name: role.name, kind: 'agent' })
   if (!model.userId && RESIDENT_TASK_LIMIT <= 0) {
     const reason =
-      'The Doop Agent needs a connected account — connect your ChatGPT subscription or OpenAI key in Settings, then retry.'
+      'The Doop Agent needs a connected account — connect your ChatGPT subscription or an OpenAI, OpenRouter, Gemini or Claude API key in Settings, then retry.'
     for (const f of actions.takeFeedbackFor(canvasId, role.name, payer)) actions.failTaskFeedback(f.id, reason)
     for (const c of actions.takeAgentCommentsFor(canvasId, role.name, payer)) actions.failComment(c.id, reason)
-    for (const c of actions.takeQueuedCardsFor(canvasId, role.name, payer)) actions.failCard(canvasId, c.id, reason)
+    for (const c of actions.takeQueuedCardsFor(canvasId, role.name, payer)) {
+      actions.chatReplyForCard(canvasId, c.id, actor, reason)
+      actions.failCard(canvasId, c.id, reason)
+    }
     stalled.add(payer)
     return 'no-model'
   }
-  const actor = actions.resolveActor({ name: role.name, kind: 'agent' })
-
   /* claim this agent's open work — the UI flips to "picked up" instantly.
      Claiming happens before the try so an agent with nothing to do never
      shows up in presence. */
@@ -248,6 +253,7 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
      repo-reading tools; only prompt cards go through the chat loop below */
   const repoCards = allCards.filter((c) => c.kind)
   const cards = allCards.filter((c) => !c.kind)
+  const canceled = () => cards.length > 0 && cards.every((card) => card.failedAt || card.endedAt)
 
   /* presence otherwise only refreshes on tool activity, and the sweep's TTL
      is shorter than a big generation turn */
@@ -313,6 +319,25 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
           items.map((i) => `- ${i.from} (about the work "${i.about}"): "${i.text}"`).join('\n'),
       )
     }
+    /* a card asked from a selection is about THAT frame or element: the
+       agent edits it in place instead of delivering something new elsewhere */
+    function describeScope(scope: AgentTask['scope']): string {
+      if (!scope) return ''
+      const f = store.getFrame(scope.frameId)
+      if (!f) {
+        /* the target is gone: say so rather than letting the request run
+           canvas-wide against something the human never pointed at */
+        return `\n  This request was scoped to frame ${scope.frameId}, which has since been deleted. Do not redesign anything else in its place: call set_status explaining that the frame it was about no longer exists, and finish.`
+      }
+      const where = `frame ${f.id} ("${f.name}")`
+      if (!scope.selector) {
+        return `\n  Scoped to ${where}: the request is about this frame. Edit it in place (edit_frame_html or set_frame_html); do not create a new frame unless the request explicitly asks for one.`
+      }
+      return (
+        `\n  Scoped to the element \`${scope.selector}\` inside ${where}: the request is about this element. ` +
+        `Call get_frame to read its HTML, change that element (and only what it needs) with edit_frame_html, and keep the rest of the frame as it is.`
+      )
+    }
     if (cards.length > 0) {
       sections.push(
         `Queued cards — work requests humans left on the board for you:\n` +
@@ -337,7 +362,8 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
                     `Call screenshot_frame on each BEFORE designing and build from what you see. ` +
                     `They are source material — leave them as they are and deliver in a separate frame.`
                   : ''
-              return `- from ${c.queuedBy}: "${c.status}"${route}${refs}`
+              const scoped = describeScope(c.scope)
+              return `- from ${c.queuedBy}: "${c.status}"${route}${scoped}${refs}`
             })
             .join('\n'),
       )
@@ -408,12 +434,15 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
       verificationFrames: new Set(),
       verifiedFrames: new Set(),
       rewriteDrafts: new Map(),
+      vision: model.vision !== false,
       ...(model.userId ? { payerId: model.userId } : {}),
       imagesGenerated: 0,
     }
     let refused = false
     let crashed = false
     let staleAccount = false
+    let accountError: string | undefined
+    let unavailableModel = false
     let finished = false
     let mutationNudgeSent = false
     let verificationNudgeSent = false
@@ -435,111 +464,158 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
             },
           ]
         : []
+      /* a text-only model would otherwise chase tools whose whole value is
+         pixels; steer its verification to the textual surfaces instead */
+      const noVisionBlock = runState.vision
+        ? []
+        : [
+            {
+              text: 'Note: your model cannot view images. screenshot_frame returns a text confirmation, not pixels, and image search results describe rather than show. Verify layout by re-reading get_frame_html and checking inspect_frame instead.',
+            },
+          ]
       const maxTurns = REDESIGN_RE.test(workText) ? MAX_REDESIGN_TURNS : MAX_TURNS
-      for (let turn = 0; turn < maxTurns; turn++) {
-        const res = await model.run({
-          maxTokens: 16000,
-          system: [{ text: systemFor(role), cache: true }, ...guidelinesBlock],
-          tools: TOOLS,
-          messages,
+      if (model.runHarness) {
+        const result = await model.runHarness({
+          canvasId,
+          prompt: kickoff,
+          system: [systemFor(role), ...guidelinesBlock.map((b) => b.text)].join('\n\n'),
+          // Image generation uses a separate paid model account; the local CLI
+          // connection must never imply that the user's subscription covers it.
+          tools: TOOLS.filter((tool) => tool.name !== 'generate_image'),
+          maxTurns,
+          isCanceled: canceled,
+          execute: async (block) => {
+            if (runState.blockedWebsiteAccess)
+              return {
+                type: 'tool_result',
+                tool_use_id: block.id,
+                content: runState.blockedWebsiteAccess,
+                is_error: true,
+              }
+            if (canceled())
+              return {
+                type: 'tool_result',
+                tool_use_id: block.id,
+                content: 'This task has been stopped.',
+                is_error: true,
+              }
+            return execTool(block, canvasId, actor, runState)
+          },
         })
+        finished = result.success
+        crashed = !result.success
+        messages.push({ role: 'assistant', content: [{ type: 'text', text: result.text }] })
+        if (!result.success) actions.agentSummary(canvasId, actor, result.text)
+      } else
+        for (let turn = 0; turn < maxTurns; turn++) {
+          if (canceled()) return 'ran'
+          const res = await model.run({
+            maxTokens: 16000,
+            system: [{ text: systemFor(role), cache: true }, ...guidelinesBlock, ...noVisionBlock],
+            tools: TOOLS,
+            messages,
+          })
 
-        if (res.stop_reason === 'refusal') {
-          actions.setAgentStatus(canvasId, actor, "Couldn't address that feedback")
-          refused = true
-          break
-        }
+          if (canceled()) return 'ran'
+          if (res.stop_reason === 'refusal') {
+            actions.setAgentStatus(canvasId, actor, "Couldn't address that feedback")
+            refused = true
+            break
+          }
 
-        messages.push({ role: 'assistant', content: res.content })
-        turnsUsed = turn + 1
-        const toolBlocks = res.content.filter(
-          (block): block is Anthropic.ToolUseBlockParam => block.type === 'tool_use',
-        )
-        console.log(
-          `[resident] response canvas=${canvasId} turn=${turnsUsed} stop=${res.stop_reason} tools=${toolBlocks.map((block) => block.name).join(',') || 'none'}`,
-        )
+          messages.push({ role: 'assistant', content: res.content })
+          turnsUsed = turn + 1
+          const toolBlocks = res.content.filter(
+            (block): block is Anthropic.ToolUseBlockParam => block.type === 'tool_use',
+          )
+          console.log(
+            `[resident] response canvas=${canvasId} turn=${turnsUsed} stop=${res.stop_reason} tools=${toolBlocks.map((block) => block.name).join(',') || 'none'}`,
+          )
 
-        /* A response can contain a complete tool_use block even when its stop
+          /* A response can contain a complete tool_use block even when its stop
          reason is max_tokens. The Messages protocol still requires an
          immediate tool_result for every emitted tool id, so content blocks —
          not stop_reason — are authoritative for tool execution. */
-        if (toolBlocks.length > 0) {
-          /* Models may emit an import and design mutations in one parallel
+          if (toolBlocks.length > 0) {
+            /* Models may emit an import and design mutations in one parallel
              batch. Run imports first and defer every other call to the next
              turn, when the model can inspect the imported source. If access is
              blocked, skip the whole remainder. Results retain protocol order. */
-          const importInBatch = toolBlocks.some((block) => block.name === 'import_webpage')
-          let importFailureInBatch: string | undefined
-          const results = await executeGuardedBatch<Anthropic.ToolUseBlockParam, Anthropic.ToolResultBlockParam>(
-            toolBlocks,
-            {
-              priority: (block) => (block.name === 'import_webpage' ? 1 : 0),
-              blocked: (block) =>
-                runState.blockedWebsiteAccess ??
-                importFailureInBatch ??
-                (importInBatch && block.name !== 'import_webpage'
-                  ? 'The website import must be inspected before any design changes. Continue on the next turn by calling screenshot_frame on the imported source.'
-                  : undefined),
-              skipped: (block, reason) => ({
-                type: 'tool_result',
-                tool_use_id: block.id,
-                content: `Skipped ${block.name}. ${reason}`,
-                is_error: true,
-              }),
-              execute: async (block) => {
-                const target = (block.input as Record<string, unknown>).frame_id
-                console.log(
-                  `[resident] tool canvas=${canvasId} name=${block.name}${typeof target === 'string' ? ` frame=${target}` : ''}`,
-                )
-                const result = await execTool(block, canvasId, actor, runState)
-                if (block.name === 'import_webpage' && result.is_error && !runState.blockedWebsiteAccess) {
-                  importFailureInBatch =
-                    'The website import failed. Correct the tool error and retry the import before making design changes.'
-                }
-                return result
+            const importInBatch = toolBlocks.some((block) => block.name === 'import_webpage')
+            let importFailureInBatch: string | undefined
+            const results = await executeGuardedBatch<Anthropic.ToolUseBlockParam, Anthropic.ToolResultBlockParam>(
+              toolBlocks,
+              {
+                priority: (block) => (block.name === 'import_webpage' ? 1 : 0),
+                blocked: (block) =>
+                  (canceled() ? 'This task has been stopped.' : undefined) ??
+                  runState.blockedWebsiteAccess ??
+                  importFailureInBatch ??
+                  (importInBatch && block.name !== 'import_webpage'
+                    ? 'The website import must be inspected before any design changes. Continue on the next turn by calling screenshot_frame on the imported source.'
+                    : undefined),
+                skipped: (block, reason) => ({
+                  type: 'tool_result',
+                  tool_use_id: block.id,
+                  content: `Skipped ${block.name}. ${reason}`,
+                  is_error: true,
+                }),
+                execute: async (block) => {
+                  const target = (block.input as Record<string, unknown>).frame_id
+                  console.log(
+                    `[resident] tool canvas=${canvasId} name=${block.name}${typeof target === 'string' ? ` frame=${target}` : ''}`,
+                  )
+                  const result = await execTool(block, canvasId, actor, runState)
+                  if (block.name === 'import_webpage' && result.is_error && !runState.blockedWebsiteAccess) {
+                    importFailureInBatch =
+                      'The website import failed. Correct the tool error and retry the import before making design changes.'
+                  }
+                  return result
+                },
               },
-            },
-          )
-          messages.push({ role: 'user', content: results })
-          continue
-        }
+            )
+            messages.push({ role: 'user', content: results })
+            continue
+          }
 
-        if (runState.blockedWebsiteAccess) {
+          if (runState.blockedWebsiteAccess) {
+            finished = true
+            break
+          }
+
+          if (res.stop_reason === 'max_tokens' && !outputLimitNudgeSent) {
+            outputLimitNudgeSent = true
+            messages.push({
+              role: 'user',
+              content:
+                'Your response reached the output limit before producing an executable edit. Continue with bounded tool calls: begin_frame_rewrite, append_frame_rewrite with each chunk under 12,000 characters, then commit_frame_rewrite and screenshot_frame.',
+            })
+            continue
+          }
+
+          if (requireMutation && deliverableFrameIds(runState).length === 0 && !mutationNudgeSent) {
+            mutationNudgeSent = true
+            messages.push({
+              role: 'user',
+              content:
+                'You have not changed or created a deliverable frame yet, so the queued design card is not complete. Imported source frames are reference material and do not count as the deliverable. Make the requested visual change now. For a full redesign, use begin_frame_rewrite, append_frame_rewrite chunks under 12,000 characters, and commit_frame_rewrite, then verify it with screenshot_frame.',
+            })
+            continue
+          }
+          const unverified = runState.vision
+            ? verificationFrameIds(runState).filter((id) => !runState.verifiedFrames.has(id))
+            : []
+          if (cards.length > 0 && unverified.length > 0 && !verificationNudgeSent) {
+            verificationNudgeSent = true
+            messages.push({
+              role: 'user',
+              content: `You have not visually verified ${unverified.join(', ')}. Call screenshot_frame for each frame, inspect the render, and fix any problems before finishing.`,
+            })
+            continue
+          }
           finished = true
           break
         }
-
-        if (res.stop_reason === 'max_tokens' && !outputLimitNudgeSent) {
-          outputLimitNudgeSent = true
-          messages.push({
-            role: 'user',
-            content:
-              'Your response reached the output limit before producing an executable edit. Continue with bounded tool calls: begin_frame_rewrite, append_frame_rewrite with each chunk under 12,000 characters, then commit_frame_rewrite and screenshot_frame.',
-          })
-          continue
-        }
-
-        if (requireMutation && deliverableFrameIds(runState).length === 0 && !mutationNudgeSent) {
-          mutationNudgeSent = true
-          messages.push({
-            role: 'user',
-            content:
-              'You have not changed or created a deliverable frame yet, so the queued design card is not complete. Imported source frames are reference material and do not count as the deliverable. Make the requested visual change now. For a full redesign, use begin_frame_rewrite, append_frame_rewrite chunks under 12,000 characters, and commit_frame_rewrite, then verify it with screenshot_frame.',
-          })
-          continue
-        }
-        const unverified = verificationFrameIds(runState).filter((id) => !runState.verifiedFrames.has(id))
-        if (cards.length > 0 && unverified.length > 0 && !verificationNudgeSent) {
-          verificationNudgeSent = true
-          messages.push({
-            role: 'user',
-            content: `You have not visually verified ${unverified.join(', ')}. Call screenshot_frame for each frame, inspect the render, and fix any problems before finishing.`,
-          })
-          continue
-        }
-        finished = true
-        break
-      }
     } catch (err) {
       /* An API/tool crash becomes a visible, manually retryable failure. */
       crashed = true
@@ -547,12 +623,22 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
          gets its own wording all the way through to the card — but only when
          the credential is theirs: a server-tier run has no account to
          reconnect, whatever error class its transport leaks */
+      accountError = err instanceof ModelConfigurationError && model.userId ? err.message : undefined
       staleAccount = err instanceof ModelAuthError && !!model.userId
+      /* likewise a model the account cannot run yet (Astra mid-rollout): the
+         fix is a different tier in Settings, and a retry on the same one
+         would only fail the same way */
+      unavailableModel = err instanceof ModelUnavailableError && !!model.userId
       console.error('[resident] run errored', err)
       actions.setAgentStatus(
         canvasId,
         actor,
-        staleAccount ? 'Your model connection expired — reconnect it' : 'Hit a snag — waiting for a retry',
+        accountError ??
+          (staleAccount
+            ? 'Your model connection expired — reconnect it'
+            : unavailableModel
+              ? 'Model not available on your account — pick another in Settings'
+              : 'Hit a snag — waiting for a retry'),
       )
     }
 
@@ -563,6 +649,7 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
     const noMutation = finished && requireMutation && deliverableFrames.length === 0 && !blockedWebsiteAccess
     const unverifiedMutation =
       finished &&
+      runState.vision &&
       !blockedWebsiteAccess &&
       cards.length > 0 &&
       verificationFrameIds(runState).some((id) => !runState.verifiedFrames.has(id))
@@ -576,28 +663,38 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
     console.log(
       `[resident] run end canvas=${canvasId} agent=${role.name} turns=${turnsUsed} finished=${finished} refused=${refused} crashed=${crashed} mutations=${runState.mutatedFrames.size} sources=${runState.sourceFrames.size} deliverables=${deliverableFrames.length} verified=${runState.verifiedFrames.size}`,
     )
+    let summary = ''
     if (finished) {
       /* The closing summary remains useful when a no-op card is returned to
          the queue: it tells the human why no deliverable was accepted. */
       const last = messages[messages.length - 1]
       if (last?.role === 'assistant' && Array.isArray(last.content)) {
-        const text = last.content
+        summary = last.content
           .filter((b): b is Anthropic.TextBlock => b.type === 'text')
           .map((b) => b.text)
           .join(' ')
-        console.log(`[resident] summary canvas=${canvasId} ${text.replace(/\s+/g, ' ').trim().slice(0, 500)}`)
-        actions.agentSummary(canvasId, actor, text)
+        console.log(`[resident] summary canvas=${canvasId} ${summary.replace(/\s+/g, ' ').trim().slice(0, 500)}`)
+        actions.agentSummary(canvasId, actor, summary)
       }
     }
+    if (canceled()) return 'ran'
     if (finished && !blockedWebsiteAccess && !noMutation && !unverifiedMutation) {
       for (const f of claimed) actions.completeTaskFeedback(f.id)
       for (const c of comments) actions.resolveComment(c.id, role.name)
-      /* a card moves to the next agent in its pipeline, or finishes here */
-      for (const c of cards) actions.advanceCard(canvasId, c.id, actor)
+      /* a card moves to the next agent in its pipeline, or finishes here —
+         and one that was asked for in the chat gets its answer there */
+      for (const c of cards) {
+        actions.chatReplyForCard(canvasId, c.id, actor, summary || 'Done.')
+        actions.advanceCard(canvasId, c.id, actor)
+      }
     } else {
       let reason: string
       if (staleAccount) {
-        reason = `${model.label} turned down the connected account. Reconnect it in Doop, then retry.${blockedWebsiteAccess ? ` ${blockedWebsiteAccess}` : ''}`
+        reason =
+          accountError ??
+          `${model.label} turned down the connected account. Reconnect it in Doop, then retry.${blockedWebsiteAccess ? ` ${blockedWebsiteAccess}` : ''}`
+      } else if (unavailableModel) {
+        reason = `${model.label} is not available on your connected account yet. Pick another model in Settings, then retry.`
       } else if (blockedWebsiteAccess) {
         reason = blockedWebsiteAccess
       } else if (refused) {
@@ -613,7 +710,10 @@ async function runAgent(canvasId: string, agentName: string, stalled: Set<string
       }
       for (const f of claimed) actions.failTaskFeedback(f.id, reason)
       for (const c of comments) actions.failComment(c.id, reason)
-      for (const c of cards) actions.failCard(canvasId, c.id, reason)
+      for (const c of cards) {
+        actions.chatReplyForCard(canvasId, c.id, actor, reason)
+        actions.failCard(canvasId, c.id, reason)
+      }
     }
   } finally {
     clearInterval(heartbeat)
@@ -1426,7 +1526,12 @@ async function execTool(
       case 'screenshot_frame': {
         const f = store.getFrame(input.frame_id)
         if (!f || f.canvasId !== canvasId) return fail('frame not found on this canvas')
-        const blocks = await frameImageBlocks(f)
+        /* a text-only model cannot see the render — skip the (paid, slow)
+           screenshot entirely and point it at the textual surfaces, while
+           keeping the verified-frames bookkeeping coherent */
+        const blocks = runState.vision
+          ? await frameImageBlocks(f)
+          : `Screenshot skipped: the selected model cannot view images. Frame "${f.name}" is ${f.width}×${f.height}px. Verify your work with get_frame_html and inspect_frame instead.`
         if (runState.mutatedFrames.has(input.frame_id) || runState.verificationFrames.has(input.frame_id)) {
           runState.verifiedFrames.add(input.frame_id)
         }

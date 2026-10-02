@@ -1,13 +1,14 @@
 import { betterAuth } from 'better-auth'
 import { APIError } from 'better-auth/api'
 import { eq, inArray, or, isNull, ne, and, sql } from 'drizzle-orm'
-import { admin, mcp, genericOAuth } from 'better-auth/plugins'
+import { admin, mcp, genericOAuth, oneTimeToken } from 'better-auth/plugins'
 import { drizzleAdapter } from 'better-auth/adapters/drizzle'
 import { db } from './db/index.ts'
 import * as authSchema from './db/auth-schema.ts'
 import { store } from './store.ts'
 import * as demo from './demo.ts'
 import { mailerConfigured, sendMail } from './mailer.ts'
+import { acceptInvites } from './workspaces.ts'
 
 /**
  * better-auth on our own database: email/password + cookie sessions now;
@@ -342,6 +343,8 @@ function buildAuth() {
          next restart picked them up in syncAdmins */
       afterEmailVerification: async (user) => {
         if (mayPromote({ email: user.email, emailVerified: true })) await promote(user.id, user.email)
+        /* a verified address is the moment a workspace invite may be honoured */
+        await acceptInvites(user.id, user.email)
       },
       sendVerificationEmail: async ({ user, url }) => {
         await sendMail({
@@ -368,6 +371,13 @@ function buildAuth() {
                With SMTP on, a fresh signup is never verified yet, so the
                promotion happens in afterEmailVerification instead. */
             if (mayPromote(user)) await promote(user.id, user.email)
+            /* workspace invites are keyed by email: with a mailer they are
+               honoured on verification (afterEmailVerification); without one
+               nobody can verify, so only local development takes the
+               address at face value — production refuses such invites up
+               front (workspaces.unknownEmailInvitesAllowed), the line
+               ADMIN_EMAILS draws too */
+            if (!mailerConfigured && process.env.NODE_ENV !== 'production') await acceptInvites(user.id, user.email)
           },
         },
       },
@@ -395,6 +405,12 @@ function buildAuth() {
     plugins: [
       mcp({ loginPage: '/' }),
       admin({ impersonationSessionDuration: 15 * 60 }),
+      /* oneTimeToken: how a Google / Microsoft / SSO sign-in finished in the
+         system browser reaches the desktop app (src/lib/desktopAuth.ts). The
+         browser session mints a token, the app redeems it and gets the same
+         session's cookie. Single use, hashed at rest, two minutes to live —
+         it travels through a doop:// URL that lands in browser history. */
+      oneTimeToken({ storeToken: 'hashed', expiresIn: 2 }),
       ...(oidc
         ? [
             genericOAuth({

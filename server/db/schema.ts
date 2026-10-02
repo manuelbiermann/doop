@@ -35,9 +35,78 @@ export const canvases = pgTable('canvases', {
   category: text('category'),
   /** how many times the gallery has copied this canvas — the "trending" signal */
   copyCount: integer('copy_count').notNull().default(0),
+  /** the shared workspace this canvas lives in; null = the owner's personal
+   *  space. Every workspace member can open a workspace canvas. */
+  workspaceId: text('workspace_id'),
   createdAt: bigint('created_at', { mode: 'number' }).notNull(),
   updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
 })
+
+/** A shared workspace: a team's home for canvases. Membership (below) grants
+ *  access to every canvas inside it, so a workspace is the org-level unit
+ *  the per-canvas invite model never had. Billing is per workspace, per
+ *  seat (see shared/billing.ts): the Stripe columns are the mirror of the
+ *  subscription, written by the webhook and the post-checkout sync — never
+ *  by a UI request directly. Without Stripe configured (self-hosting) the
+ *  status column is ignored and every workspace is active. */
+export const workspaces = pgTable('workspaces', {
+  id: text('id').primaryKey(),
+  name: text('name').notNull(),
+  ownerId: text('owner_id').notNull(),
+  /** 'inactive' (never paid) | 'trialing' | 'active' | 'past_due' | 'canceled' */
+  status: text('status').notNull().default('inactive'),
+  /** 'team'; null until a plan was chosen */
+  plan: text('plan'),
+  /** 'month' | 'year' */
+  interval: text('interval'),
+  /** the paid seat count Stripe is billing for */
+  seats: integer('seats').notNull().default(0),
+  stripeCustomerId: text('stripe_customer_id'),
+  stripeSubscriptionId: text('stripe_subscription_id'),
+  /** epoch ms the current billing period ends (= the next renewal) */
+  currentPeriodEnd: bigint('current_period_end', { mode: 'number' }),
+  cancelAtPeriodEnd: boolean('cancel_at_period_end').notNull().default(false),
+  /** Stripe's `created` of the last subscription event applied (epoch s) —
+   *  an older event arriving late must not roll the mirror back */
+  billingEventAt: bigint('billing_event_at', { mode: 'number' }),
+  createdAt: bigint('created_at', { mode: 'number' }).notNull(),
+  updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
+})
+
+/** Who is in a workspace, and as what. The owner IS listed here (role
+ *  'owner'), unlike canvas_members — every seat is a row, so the seat count
+ *  billed to Stripe is a plain count of this table. */
+export const workspaceMembers = pgTable(
+  'workspace_members',
+  {
+    workspaceId: text('workspace_id').notNull(),
+    userId: text('user_id').notNull(),
+    /** 'owner' | 'admin' | 'member' */
+    role: text('role').notNull(),
+    addedBy: text('added_by').notNull(),
+    addedAt: bigint('added_at', { mode: 'number' }).notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.workspaceId, t.userId] }), index('workspace_members_user_idx').on(t.userId)],
+)
+
+/** An invitation to someone who has no doop account yet. Accepted
+ *  automatically the moment an account with that email is created; a seat
+ *  is only billed from then on. */
+export const workspaceInvites = pgTable(
+  'workspace_invites',
+  {
+    id: text('id').primaryKey(),
+    workspaceId: text('workspace_id').notNull(),
+    email: text('email').notNull(),
+    role: text('role').notNull(),
+    invitedBy: text('invited_by').notNull(),
+    createdAt: bigint('created_at', { mode: 'number' }).notNull(),
+  },
+  (t) => [
+    uniqueIndex('workspace_invites_workspace_email_idx').on(t.workspaceId, t.email),
+    index('workspace_invites_email_idx').on(t.email),
+  ],
+)
 
 /** Users invited to collaborate on a canvas (the owner is not listed).
  *  Access = owner ∪ members ∪ (everyone, when link_access = 'edit'). */
@@ -126,6 +195,30 @@ export const syncEdges = pgTable(
   (t) => [primaryKey({ columns: [t.keyId, t.fromPage, t.toPage] })],
 )
 
+/** Agent keys: account-scoped bearer credentials for the /mcp endpoint — the
+ *  headless counterpart to the MCP OAuth flow, for agents with no browser to
+ *  approve in (Mastra, n8n, CI). A key acts as its owner: every MCP call it
+ *  authenticates goes through the same canvas-access gate as an OAuth
+ *  session. Unlike sync keys the secret is hashed at rest — it grants the
+ *  account's full agent surface, not a single write-only drop box — and is
+ *  shown once, at mint time. `start` keeps the first characters so the list
+ *  UI can say which key is which. Revocation = row deletion, checked on
+ *  every request. */
+export const agentKeys = pgTable(
+  'agent_keys',
+  {
+    id: text('id').primaryKey(),
+    /** sha256 hex of the full secret; the secret itself is never stored */
+    secretHash: text('secret_hash').notNull(),
+    userId: text('user_id').notNull(),
+    name: text('name').notNull(),
+    start: text('start').notNull(),
+    createdAt: bigint('created_at', { mode: 'number' }).notNull(),
+    lastUsedAt: bigint('last_used_at', { mode: 'number' }),
+  },
+  (t) => [index('agent_keys_user_idx').on(t.userId), uniqueIndex('agent_keys_hash_idx').on(t.secretHash)],
+)
+
 /** A GitHub repo connected to a canvas as an import source. Two credential
  *  modes: a GitHub App installation (`installationId` set, short-lived
  *  tokens minted per call — the preferred flow) or a fine-grained PAT
@@ -181,6 +274,10 @@ export const tasks = pgTable(
     kind: text('kind'),
     /** JSON payload of a structured card — what its runner needs, never a secret */
     payload: text('payload'),
+    /** JSON CardScope: the frame/element the prompt was scoped to when queued */
+    scope: text('scope'),
+    /** comma-joined ids of the frames edited while the task was open, most recent last */
+    frameIds: text('frame_ids'),
   },
   (t) => [index('tasks_canvas_idx').on(t.canvasId)],
 )
@@ -229,6 +326,27 @@ export const comments = pgTable(
     parentId: text('parent_id'),
   },
   (t) => [index('comments_canvas_idx').on(t.canvasId)],
+)
+
+/** The canvas chat. Rows are immutable: a message that queued a card points
+ *  at it through task_id, an agent's answer points back through reply_to_id. */
+export const chatMessages = pgTable(
+  'chat_messages',
+  {
+    id: text('id').primaryKey(),
+    canvasId: text('canvas_id').notNull(),
+    fromName: text('from_name').notNull(),
+    fromKind: text('from_kind').notNull(),
+    fromUserId: text('from_user_id'),
+    color: text('color').notNull(),
+    text: text('text').notNull(),
+    at: bigint('at', { mode: 'number' }).notNull(),
+    /** comma-joined agent-role ids the text @mentions, in order */
+    mentions: text('mentions'),
+    taskId: text('task_id'),
+    replyToId: text('reply_to_id'),
+  },
+  (t) => [index('chat_messages_canvas_idx').on(t.canvasId)],
 )
 
 /** Uploaded image assets: metadata only — bytes live in object storage (or
@@ -487,4 +605,65 @@ export const automationRuns = pgTable(
     failure: text('failure'),
   },
   (t) => [index('automation_runs_automation_idx').on(t.automationId)],
+)
+
+/** Local execution preference; Claude credentials never leave the desktop. */
+export const localAgentPreferences = pgTable('local_agent_preferences', {
+  userId: text('user_id').primaryKey(),
+  enabled: boolean('enabled').notNull().default(false),
+  model: text('model').notNull().default('default'),
+})
+
+/** Which image model generate_image draws with, per user. Separate from
+ *  model_accounts because a server-tier user (no account row) still picks
+ *  among the server-enabled image models. */
+export const imagePrefs = pgTable('image_prefs', {
+  userId: text('user_id').primaryKey(),
+  model: text('model').notNull(),
+  updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
+})
+
+/** One app-actor installation per Linear workspace, billed to its installer. */
+export const linearInstallations = pgTable('linear_installations', {
+  organizationId: text('organization_id').primaryKey(),
+  userId: text('user_id').notNull().unique(),
+  appUserId: text('app_user_id').notNull(),
+  name: text('name').notNull(),
+  accessToken: text('access_token').notNull(),
+  refreshToken: text('refresh_token').notNull(),
+  expiresAt: bigint('expires_at', { mode: 'number' }).notNull(),
+  connectedAt: bigint('connected_at', { mode: 'number' }).notNull(),
+})
+
+export const linearOAuthStates = pgTable('linear_oauth_states', {
+  hash: text('hash').primaryKey(),
+  userId: text('user_id').notNull(),
+  verifier: text('verifier').notNull(),
+  expiresAt: bigint('expires_at', { mode: 'number' }).notNull(),
+})
+
+/** A durable inbox and result outbox. Session IDs deduplicate Linear retries. */
+export const linearSessions = pgTable(
+  'linear_sessions',
+  {
+    id: text('id').primaryKey(),
+    organizationId: text('organization_id').notNull(),
+    userId: text('user_id').notNull(),
+    issueId: text('issue_id'),
+    title: text('title').notNull(),
+    prompt: text('prompt').notNull(),
+    status: text('status').notNull().default('pending'),
+    canvasId: text('canvas_id'),
+    taskId: text('task_id'),
+    error: text('error'),
+    ackId: text('ack_id').notNull(),
+    resultId: text('result_id').notNull(),
+    nextAttemptAt: bigint('next_attempt_at', { mode: 'number' }).notNull().default(0),
+    linked: boolean('linked').notNull().default(false),
+    acknowledged: boolean('acknowledged').notNull().default(false),
+    reported: boolean('reported').notNull().default(false),
+    createdAt: bigint('created_at', { mode: 'number' }).notNull(),
+    updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
+  },
+  (t) => [index('linear_sessions_status_idx').on(t.status)],
 )

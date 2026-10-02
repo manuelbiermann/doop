@@ -1,5 +1,77 @@
 # Changelog
 
+## [0.7.0](https://github.com/kgoedecke/doop/compare/v0.6.0...v0.7.0) (2026-10-01)
+
+
+### Features
+
+* **agent:** add an opt-in Gemini cloud worker prototype ([#220](https://github.com/kgoedecke/doop/issues/220)) ([f154e92](https://github.com/kgoedecke/doop/commit/f154e929566c8522edbf8e4e7cee7e21822404ba))
+* **agents:** support OpenRouter and Gemini model accounts and an image-model registry ([#211](https://github.com/kgoedecke/doop/issues/211)) ([3253e88](https://github.com/kgoedecke/doop/commit/3253e885f27af81910957c4ed9c5bd964d72a10d))
+* **canvas:** export progress toast and desktop save panel for exports ([#221](https://github.com/kgoedecke/doop/issues/221)) ([34b65ca](https://github.com/kgoedecke/doop/commit/34b65cac24ba43a29e1b24e3cdc85c7fed116d0d))
+* **canvas:** move frame export options into a modal ([#219](https://github.com/kgoedecke/doop/issues/219)) ([aa6cb82](https://github.com/kgoedecke/doop/commit/aa6cb821f4b2cd84190dda473c88033dfc2359dc))
+* **canvas:** per-canvas chat with [@mentions](https://github.com/mentions) that assign agents ([#197](https://github.com/kgoedecke/doop/issues/197)) ([2c4f077](https://github.com/kgoedecke/doop/commit/2c4f077f4fe3cd5b0eeb4912d087e8dd0ad81cb6))
+* **canvas:** redesign the import modal as a source picker with one screen per source ([#208](https://github.com/kgoedecke/doop/issues/208)) ([e5eaafb](https://github.com/kgoedecke/doop/commit/e5eaafbe8777312063c4bb4ebdbd403c8956f5da))
+* **linear:** run Doop designs from delegated linear tickets ([#214](https://github.com/kgoedecke/doop/issues/214)) ([44c32ac](https://github.com/kgoedecke/doop/commit/44c32aca25d9cb051dc64a218f77100b987d6ed4))
+* **mcp:** agent keys for headless MCP clients (bearer auth) ([#213](https://github.com/kgoedecke/doop/issues/213)) ([33379d4](https://github.com/kgoedecke/doop/commit/33379d46451b66f038e07b7784e4cdb0ed4e0086))
+
+
+### Bug Fixes
+
+* **agents:** drop the hover-only 'Not available' label on task rows ([#200](https://github.com/kgoedecke/doop/issues/200)) ([fbfdd9a](https://github.com/kgoedecke/doop/commit/fbfdd9af5f210d2d2bf62b55577dfda20d9d2997))
+* **canvas:** drop icons from import screen primary actions ([#215](https://github.com/kgoedecke/doop/issues/215)) ([510a2da](https://github.com/kgoedecke/doop/commit/510a2da7e60d6a766ea7a23515f0e6ea2e673713))
+* **canvas:** keep a followed avatar's colour under the follow halo ([#162](https://github.com/kgoedecke/doop/issues/162)) ([77cb306](https://github.com/kgoedecke/doop/commit/77cb306aad47b9c901979c9d246105958458d7fb))
+* land a new frame in the middle of the current view ([#165](https://github.com/kgoedecke/doop/issues/165)) ([d540e7e](https://github.com/kgoedecke/doop/commit/d540e7e1a1d6199973abc7306fc7b226c176d1ca))
+* **linear:** simplify integration card and use official logo ([#222](https://github.com/kgoedecke/doop/issues/222)) ([f08782c](https://github.com/kgoedecke/doop/commit/f08782cac64ddd4c42fc1fa9563a2f66fda1416a))
+* **server:** bump undici to 8.x to stop an uncatchable parser crash ([#198](https://github.com/kgoedecke/doop/issues/198)) ([894b1a2](https://github.com/kgoedecke/doop/commit/894b1a2c2da2593c3474479932af5507d7ba7a2a))
+
+## [0.6.0](https://github.com/kgoedecke/doop/compare/v0.5.0...v0.6.0) (2026-09-19)
+
+
+### Features
+
+* **agent:** add Claude CLI and API key providers ([#155](https://github.com/kgoedecke/doop/issues/155)) ([4bed23d](https://github.com/kgoedecke/doop/commit/4bed23da489bcb5345e483015c791b51ff30c81e))
+* **agent:** add GPT-6 Astra to the OpenAI model menu ([#190](https://github.com/kgoedecke/doop/issues/190)) ([31123df](https://github.com/kgoedecke/doop/commit/31123dfcbfb6dfa3d2770eaaec14eed67f33f186))
+* **canvas:** locate and follow collaborators from task rows and avatars ([#191](https://github.com/kgoedecke/doop/issues/191)) ([876abcf](https://github.com/kgoedecke/doop/commit/876abcf894981f86fa8c67f9bfd3905fc6d5e649))
+
+
+### Bug Fixes
+
+* **canvas:** keep frame title labels from stealing clicks at low zoom ([#193](https://github.com/kgoedecke/doop/issues/193)) ([3a5df79](https://github.com/kgoedecke/doop/commit/3a5df790acc565fe44ced06443c461d0b3dfc34e))
+* **canvas:** snap duplicate-drags to guides and let ⌫ delete the picked element ([#187](https://github.com/kgoedecke/doop/issues/187)) ([08c9fe7](https://github.com/kgoedecke/doop/commit/08c9fe776c712bf9bf141ed281305c3f8b1b56c4))
+* close the socket with a clear code when a canvas does not exist ([#154](https://github.com/kgoedecke/doop/issues/154)) ([39f037e](https://github.com/kgoedecke/doop/commit/39f037ed4e484ae2781c484f0f45c69b5ed6c725)), closes [#73](https://github.com/kgoedecke/doop/issues/73)
+* **db:** renumber the local-agent migration to 0017 behind task_frames ([a4cc4bb](https://github.com/kgoedecke/doop/commit/a4cc4bbc72363694fa77d33125fb5047f97ba95f))
+* one-click copy button for the frame's HTML code ([#148](https://github.com/kgoedecke/doop/issues/148)) ([2230a8b](https://github.com/kgoedecke/doop/commit/2230a8bd6435a7a357c5544cb9506903e4df4836))
+
+
+### Documentation
+
+* **agents:** teach agents to generate hero backgrounds ([90853e8](https://github.com/kgoedecke/doop/commit/90853e8277e03befc4edb880fa7853416fa9d62c))
+
+## [0.5.0](https://github.com/kgoedecke/doop/compare/v0.4.0...v0.5.0) (2026-09-16)
+
+
+### Features
+
+* **agents:** generate_image tool draws with AI on the user's own account ([#165](https://github.com/kgoedecke/doop/issues/165)) ([ad55317](https://github.com/kgoedecke/doop/commit/ad553177f327b468c84a6c111474f70bda13c0d5))
+* **automations:** scheduled pulls and agent tasks, with a Meta integration ([#168](https://github.com/kgoedecke/doop/issues/168)) ([ce34ba6](https://github.com/kgoedecke/doop/commit/ce34ba67df715c2ed32e1de4ddc66e72041534f0))
+* **canvas:** element properties panel opens from a click on the canvas ([#167](https://github.com/kgoedecke/doop/issues/167)) ([510fdfe](https://github.com/kgoedecke/doop/commit/510fdfecb0d5214ede2dcfd787c9e5f342fddcb7))
+* **canvas:** prompt bar scopes a request to the selected frame or element ([#180](https://github.com/kgoedecke/doop/issues/180)) ([ba36d77](https://github.com/kgoedecke/doop/commit/ba36d77494e0c9f2ae7bf62ff8830697897aebe8))
+* **canvas:** reorder elements in the Layers panel ([#164](https://github.com/kgoedecke/doop/issues/164)) ([fbc831e](https://github.com/kgoedecke/doop/commit/fbc831ef05264c5f3bbd6cc7ac310bf897d69447))
+* **desktop:** google, microsoft and sso sign-in through the system browser with a doop:// handoff ([#177](https://github.com/kgoedecke/doop/issues/177)) ([5b51765](https://github.com/kgoedecke/doop/commit/5b517654bdada4d41820f51f04037fd24bfaa501))
+* **mcp:** reply to and resolve element comments ([#150](https://github.com/kgoedecke/doop/issues/150)) ([775fd2e](https://github.com/kgoedecke/doop/commit/775fd2e6e222ab0a4cb197cb14fb70699d0f5a80))
+* **workspaces:** shared workspaces with a per-seat Team plan on Stripe ([#170](https://github.com/kgoedecke/doop/issues/170)) ([f64c9ab](https://github.com/kgoedecke/doop/commit/f64c9ab869cdc5742a385fbe5fab43b4b59304c6))
+
+
+### Bug Fixes
+
+* **canvas:** clicking a second element in a frame moves the selection ([#171](https://github.com/kgoedecke/doop/issues/171)) ([bd23ae6](https://github.com/kgoedecke/doop/commit/bd23ae6818221a947245f6ef1bbbd304fc121c25))
+* **canvas:** guard Layers drops against void targets and stale selectors ([#169](https://github.com/kgoedecke/doop/issues/169)) ([8cfcd1a](https://github.com/kgoedecke/doop/commit/8cfcd1a050b401b8a011735a0a336dade07a93ec))
+* **layers:** delete key on a layer row no longer deletes the whole frame ([#179](https://github.com/kgoedecke/doop/issues/179)) ([377ae4c](https://github.com/kgoedecke/doop/commit/377ae4c003ba56cbf9dafe1c06266b6aee5e8ec6))
+* **mcp:** bill agent comment replies to the connecting user, not the canvas owner ([5198236](https://github.com/kgoedecke/doop/commit/5198236d7ef2bd7e38068af1b4877f1d9ad66fee))
+* **mcp:** protected-resource metadata names the /mcp endpoint so strict OAuth clients can connect ([#174](https://github.com/kgoedecke/doop/issues/174)) ([fcf2947](https://github.com/kgoedecke/doop/commit/fcf2947b9c8d292cde3fa44ccd027ea3e8049c28))
+* **replay:** capture sandboxed frame content in PostHog ([#176](https://github.com/kgoedecke/doop/issues/176)) ([4a50323](https://github.com/kgoedecke/doop/commit/4a50323d15f2efd750479214ddbeead384ddab4a))
+* **workspaces:** order billing events across subscriptions, durable revocations, owner-only moves in ([33aff5c](https://github.com/kgoedecke/doop/commit/33aff5c6c5c482095137f3e52e3d2b7cfdf70ee5))
+
 ## [0.4.0](https://github.com/kgoedecke/doop/compare/v0.3.0...v0.4.0) (2026-09-10)
 
 

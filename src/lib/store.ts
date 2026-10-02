@@ -3,12 +3,14 @@ import type {
   ActivityItem,
   AgentTask,
   Canvas,
+  ChatMessage,
   DesignDecision,
   ElementComment,
   Frame,
   GuidelineDoc,
   MemoryProposal,
   MemoryReference,
+  PeerViewport,
   Presence,
   TaskFeedback,
 } from '../../shared/types'
@@ -18,6 +20,18 @@ export interface Viewport {
   x: number
   y: number
   zoom: number
+}
+
+export type PanelTab = 'tasks' | 'chat' | 'activity' | 'memory'
+
+const chatSeenKey = (canvasId: string) => `doop:chatSeen:${canvasId}`
+
+function loadChatSeen(canvasId: string): number {
+  try {
+    return Number(localStorage.getItem(chatSeenKey(canvasId)) ?? 0) || 0
+  } catch {
+    return 0
+  }
 }
 
 interface State {
@@ -31,13 +45,18 @@ interface State {
   feedback: TaskFeedback[]
   /** element-anchored comments (newest first) */
   comments: ElementComment[]
+  /** the canvas chat (newest first) */
+  chat: ChatMessage[]
+  /** when this browser last had the chat open on this canvas — everything
+   *  newer from someone else counts as unread on the rail */
+  chatSeenAt: number
   /** design decisions captured into Memory (newest first) */
   decisions: DesignDecision[]
   /** distiller rule proposals (newest first) */
   proposals: MemoryProposal[]
   /** which tab the side panel shows — in the store so a Memory-suggestion
    *  toast anywhere in the app can jump straight to the Memory tab */
-  panelTab: 'tasks' | 'activity' | 'memory'
+  panelTab: PanelTab
   /** every selected frame, in selection order — marquee and ⇧-click build
    *  this up; a plain click collapses it to one */
   selectedIds: string[]
@@ -66,12 +85,20 @@ interface State {
   /** live alignment guide lines while a frame drag is snapped to a neighbour */
   snapGuides: SnapGuide[]
   connected: boolean
+  /** the join for the current canvasId was refused: no such canvas (deleted,
+   *  or the id in the URL was never one) — CanvasPage shows a not-found
+   *  screen instead of an unusable, unresponsive canvas UI */
+  canvasNotFound: boolean
   /** a reconnect revealed a newer client bundle on the server — offer a reload */
   updateReady: boolean
   /** frameId -> color, set briefly when a remote actor updates a frame */
   flashes: Record<string, { color: string; at: number }>
   /** frameId -> actor currently streaming a design into it */
   streams: Record<string, { name: string; color: string }>
+  /** a transient toast — in the store so long actions fired from surfaces
+   *  that close at once (a context menu) can still report back. A `busy`
+   *  notice (an export in flight) stays up until the next notice replaces it. */
+  notice: { text: string; at: number; busy?: boolean } | null
   /** the free-tier wall is showing — in the store so any surface that hits
    *  the resident-task limit (board, prompt bar, element comment) can raise it */
   limitWall: boolean
@@ -80,16 +107,25 @@ interface State {
   allowanceVersion: number
   /** a request for the Stage to glide the camera to a frame — the prompt bar
    *  raises it so a first deliverable streams in on-screen, never off-canvas */
-  flyTo: { frameId: string; at: number } | null
+  flyTo: { frameId: string; at: number } | { point: { x: number; y: number }; at: number } | null
+  /** clientId of the peer whose camera this one is tracking (Figma-style
+   *  follow); any camera move of our own lets go */
+  following: string | null
 
   setCanvas(c: Canvas | null): void
   setConnected(v: boolean): void
+  setCanvasNotFound(v: boolean): void
   setUpdateReady(v: boolean): void
   setPresences(list: Presence[]): void
   upsertPresence(p: Presence): void
   removePresence(clientId: string): void
   setCursor(clientId: string, x: number, y: number): void
   setEditing(clientId: string, frameId: string | null): void
+  setPeerViewport(clientId: string, viewport: PeerViewport): void
+  /** start (clientId) or stop (null) following a peer's camera */
+  setFollowing(clientId: string | null): void
+  /** camera write that keeps the follow alive — only the follow loop uses it */
+  setViewportFollowing(v: Viewport): void
   setStatus(clientId: string, status: string | null): void
   setActivity(items: ActivityItem[]): void
   pushActivity(item: ActivityItem): void
@@ -99,6 +135,10 @@ interface State {
   upsertFeedback(fb: TaskFeedback): void
   setComments(comments: ElementComment[]): void
   upsertComment(c: ElementComment): void
+  setChat(messages: ChatMessage[]): void
+  pushChat(message: ChatMessage): void
+  /** the chat is on screen: nothing is unread any more */
+  markChatSeen(): void
   upsertFrame(f: Frame): void
   patchFrameLocal(frameId: string, patch: Partial<Frame>): void
   removeFrame(frameId: string): void
@@ -111,10 +151,15 @@ interface State {
   pushDecision(decision: DesignDecision): void
   setProposals(proposals: MemoryProposal[]): void
   upsertProposal(proposal: MemoryProposal): void
-  setPanelTab(tab: 'tasks' | 'activity' | 'memory'): void
+  setPanelTab(tab: PanelTab): void
+  /** show `text` as a toast for a few seconds — or, with `busy`, with a
+   *  spinner until the next notice replaces it */
+  pushNotice(text: string, options?: { busy?: boolean }): void
   setLimitWall(v: boolean): void
   allowanceChanged(): void
   requestFlyTo(frameId: string): void
+  /** glide the camera to a world point at the current zoom (a peer's cursor) */
+  requestFlyToPoint(x: number, y: number): void
   select(id: string | null): void
   /** ⇧-click: add the frame to the selection, or drop it if already in */
   toggleSelect(id: string): void
@@ -138,6 +183,8 @@ interface State {
 }
 
 const LAYERS_OPEN_KEY = 'doop:layers-open'
+/* longer than the slowest real export (Canva: render + verify, ~3 min) */
+const BUSY_NOTICE_MAX_MS = 5 * 60_000
 
 function readLayersOpen(): boolean {
   try {
@@ -155,12 +202,15 @@ export const useStore = create<State>((set, get) => ({
   tasks: [],
   feedback: [],
   comments: [],
+  chat: [],
+  chatSeenAt: 0,
   decisions: [],
   proposals: [],
   panelTab: 'tasks',
   limitWall: false,
   allowanceVersion: 0,
   flyTo: null,
+  following: null,
   selectedIds: [],
   selectedId: null,
   panMode: false,
@@ -172,14 +222,22 @@ export const useStore = create<State>((set, get) => ({
   viewport: { x: 0, y: 0, zoom: 1 },
   snapGuides: [],
   connected: false,
+  canvasNotFound: false,
   updateReady: false,
+  notice: null,
   flashes: {},
   streams: {},
 
   setCanvas: (canvas) => set({ canvas }),
   setConnected: (connected) => set({ connected }),
+  setCanvasNotFound: (canvasNotFound) => set({ canvasNotFound }),
   setUpdateReady: (updateReady) => set({ updateReady }),
-  setPresences: (list) => set({ presences: Object.fromEntries(list.map((p) => [p.clientId, p])) }),
+  setPresences: (list) =>
+    set((s) => ({
+      presences: Object.fromEntries(list.map((p) => [p.clientId, p])),
+      /* a fresh roster (new canvas, reconnect) without our leader ends the follow */
+      ...(s.following && !list.some((p) => p.clientId === s.following) ? { following: null } : {}),
+    })),
   upsertPresence: (p) => set((s) => ({ presences: { ...s.presences, [p.clientId]: p } })),
   removePresence: (clientId) =>
     set((s) => {
@@ -187,8 +245,17 @@ export const useStore = create<State>((set, get) => ({
       const cursors = { ...s.cursors }
       delete presences[clientId]
       delete cursors[clientId]
-      return { presences, cursors }
+      /* the one we were following left: nothing to track any more */
+      return { presences, cursors, ...(s.following === clientId ? { following: null } : {}) }
     }),
+  setPeerViewport: (clientId, viewport) =>
+    set((s) => {
+      const p = s.presences[clientId]
+      if (!p) return {}
+      return { presences: { ...s.presences, [clientId]: { ...p, viewport } } }
+    }),
+  setFollowing: (following) => set({ following }),
+  setViewportFollowing: (viewport) => set({ viewport }),
   setCursor: (clientId, x, y) => set((s) => ({ cursors: { ...s.cursors, [clientId]: { x, y } } })),
   setEditing: (clientId, frameId) =>
     set((s) => {
@@ -215,6 +282,22 @@ export const useStore = create<State>((set, get) => ({
     }),
   setFeedback: (feedback) => set({ feedback }),
   setComments: (comments) => set({ comments }),
+  setChat: (chat) => set((s) => ({ chat, chatSeenAt: s.canvas ? loadChatSeen(s.canvas.id) : 0 })),
+  pushChat: (message) =>
+    set((s) => (s.chat.some((m) => m.id === message.id) ? {} : { chat: [message, ...s.chat].slice(0, 300) })),
+  markChatSeen: () =>
+    set((s) => {
+      const latest = s.chat[0]?.at ?? 0
+      if (latest <= s.chatSeenAt) return {}
+      if (s.canvas) {
+        try {
+          localStorage.setItem(chatSeenKey(s.canvas.id), String(latest))
+        } catch {
+          /* private mode: the badge just comes back next visit */
+        }
+      }
+      return { chatSeenAt: latest }
+    }),
   upsertComment: (c) =>
     set((s) => {
       const comments = s.comments.some((x) => x.id === c.id)
@@ -299,9 +382,28 @@ export const useStore = create<State>((set, get) => ({
       return { proposals }
     }),
   setPanelTab: (panelTab) => set({ panelTab }),
+  pushNotice: (text, options) => {
+    const busy = options?.busy === true
+    const at = Date.now()
+    set({ notice: { text, at, busy } })
+    if (busy) {
+      /* a backstop for a request that never settles (a stalled Canva
+         export) — normally the outcome replaces a busy notice long before */
+      setTimeout(() => {
+        if (get().notice?.at === at) set({ notice: null })
+      }, BUSY_NOTICE_MAX_MS)
+      return
+    }
+    setTimeout(() => {
+      const cur = get().notice
+      /* only clear our own notice — a newer one restarts the clock */
+      if (cur && !cur.busy && Date.now() - cur.at >= 4900) set({ notice: null })
+    }, 5000)
+  },
   setLimitWall: (limitWall) => set({ limitWall }),
   allowanceChanged: () => set((s) => ({ allowanceVersion: s.allowanceVersion + 1 })),
   requestFlyTo: (frameId) => set({ flyTo: { frameId, at: Date.now() } }),
+  requestFlyToPoint: (x, y) => set({ flyTo: { point: { x, y }, at: Date.now() } }),
   /* selecting a different frame (or deselecting) closes the Inspector — the
      panel must not follow surface clicks, paste, or undo onto another frame.
      Re-selecting the same frame keeps an open panel open. */
@@ -354,7 +456,8 @@ export const useStore = create<State>((set, get) => ({
     }
     set({ layersOpen })
   },
-  setViewport: (viewport) => set({ viewport }),
+  /* every ordinary camera move (pan, zoom, fit, fly-to) is ours, so it ends a follow */
+  setViewport: (viewport) => set({ viewport, following: null }),
   /* fires on every pointermove during a drag — skip the no-op transitions
      so unsnapped drags don't render the (empty) guide layer each frame */
   setSnapGuides: (snapGuides) =>

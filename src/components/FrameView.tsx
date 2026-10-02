@@ -31,6 +31,9 @@ import { RoleMark } from './RoleMark'
    by the `--zoom` variable the Stage publishes (capped at 2.4× when zoomed
    far out). Preserve these expressions exactly. */
 const COUNTER_SCALE = '[transform:scale(min(calc(1/var(--zoom,1)),2.4))]'
+/* the inverse of COUNTER_SCALE: a box this wide, once counter-scaled, spans
+   exactly the frame's width on screen */
+const LABEL_WIDTH = '[width:calc(100%*max(var(--zoom,1),calc(1/2.4)))]'
 const EDITOR_CHIP =
   'inline-flex items-center gap-1 rounded-full px-[7px] py-0.5 text-[10px] font-bold text-white animate-[chip-in_0.25s_ease]'
 /* the element toolbar's buttons sit on ink and stay compact */
@@ -151,6 +154,11 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
       /* clicking a frame already in a group keeps the group — the drag
          moves all of them */
       select(frame.id)
+    } else if (panelOnClick && useStore.getState().selectedElement?.frameId === frame.id) {
+      /* grabbing the title bar while one of its elements is picked means
+         "the whole frame now" — drop the element selection */
+      useStore.getState().pickElement(null)
+      closePopovers() // and its outline, so a stale target never lingers
     }
     setDragging(true)
     clearHover()
@@ -208,10 +216,13 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
               width: Math.max(120, Math.round(from.width + dx)),
               height: Math.max(80, Math.round(from.height + dy)),
             }
-      /* edges pull onto neighbouring frames' edges/centers; ⌥ drags free.
-         Frames riding along in the group are not neighbours. */
+      /* edges pull onto neighbouring frames' edges/centers; ⌥ drags free —
+         except that a ⌥⇧ duplicate-drag holds ⌥ for the whole gesture, and
+         the copy should land on the guides like any other move. Frames
+         riding along in the group are not neighbours. */
       const others = useStore.getState().canvas?.frames.filter((f) => !groupIds.has(f.id)) ?? []
-      const snapped = ev.altKey ? { ...raw, guides: [] } : snapFrame(mode, raw, others, zoom)
+      const free = ev.altKey && !duplicating
+      const snapped = free ? { ...raw, guides: [] } : snapFrame(mode, raw, others, zoom)
       useStore.getState().setSnapGuides(snapped.guides)
       if (mode === 'move') {
         /* the snapped delta of the dragged frame moves the whole group */
@@ -400,14 +411,25 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
   }, [probeSel, frame.id])
   const wantedSel = useStore((s) => (s.selectedElement?.frameId === frame.id ? s.selectedElement.selector : null))
   const selectReq = useRef(0)
+  const selectSel = useRef<string | null>(null)
   useEffect(() => {
     if (!runtimeReady || !wantedSel || wantedSel === probeSel) return
+    /* a surface click clears the probe, and the effect above has just cleared
+       the store to match — but this render still carries the old selector.
+       Re-selecting it here would resurrect the previous element and (via the
+       select-result's closePopovers) cancel the pending click probe, so only
+       a selection that is still live in the store (a Layers row pick) is
+       resolved into a probe. A request already in flight for the old
+       selector is dropped for the same reason. */
+    const live = useStore.getState().selectedElement
     selectReq.current += 1
+    if (live?.frameId !== frame.id || live.selector !== wantedSel) return
+    selectSel.current = wantedSel
     iframeRef.current?.contentWindow?.postMessage(
       { type: 'doop:select', reqId: selectReq.current, selector: wantedSel },
       '*',
     )
-  }, [runtimeReady, wantedSel, probeSel])
+  }, [runtimeReady, wantedSel, probeSel, frame.id])
 
   useEffect(() => {
     function onMsg(ev: MessageEvent) {
@@ -416,6 +438,10 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
         setProbe(ev.data.hit ?? null)
       }
       if (ev.data?.type === 'doop:select-result' && ev.data.reqId === selectReq.current) {
+        /* the answer is only acted on while the asked-for element is still
+           the live selection — a surface click in the meantime has moved on */
+        const live = useStore.getState().selectedElement
+        if (live?.frameId !== frame.id || live.selector !== selectSel.current) return
         const hit = (ev.data.hit ?? null) as ProbeHit | null
         closePopovers()
         if (hit) setProbe(hit)
@@ -454,7 +480,7 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
     }
     window.addEventListener('message', onMsg)
     return () => window.removeEventListener('message', onMsg)
-  }, [])
+  }, [frame.id])
 
   /* Esc dismisses popovers (edit mode has its own Esc path inside the iframe) */
   useEffect(() => {
@@ -573,7 +599,12 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
         >
           <div
             className={cn(
-              'absolute -top-[26px] left-0 right-0 flex origin-bottom-left cursor-grab select-none items-center gap-2 whitespace-nowrap text-[12px] font-semibold text-ink-soft',
+              'absolute -top-[26px] left-0 flex origin-bottom-left cursor-grab select-none items-center gap-2 overflow-hidden whitespace-nowrap text-[12px] font-semibold text-ink-soft',
+              /* the label is counter-scaled from its bottom-left corner, so
+                 its box must be pre-shrunk by the same factor: a full-width
+                 box scaled by 1/zoom would reach far past the frame's right
+                 edge and swallow pointer-downs meant for the frames beside it */
+              LABEL_WIDTH,
               COUNTER_SCALE,
             )}
             style={duping || dupKeyHeld ? { cursor: DUP_CURSOR } : undefined}
@@ -653,6 +684,7 @@ export const FrameView = memo(function FrameView({ frame, raster }: { frame: Fra
               ref={iframeRef}
               className="block border-none bg-white"
               title={frame.name}
+              data-doop-frame=""
               sandbox="allow-scripts"
               srcDoc={FRAME_BOOTSTRAP}
               style={{

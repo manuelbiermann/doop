@@ -1,4 +1,5 @@
 import type { ClientMessage, ServerMessage } from '../../shared/types'
+import { isPeerViewport } from '../../shared/viewport'
 import { getIdentity } from './identity'
 import { useStore } from './store'
 
@@ -10,6 +11,9 @@ let loadedBuild: string | null = null
 
 export function connect(canvasId: string) {
   currentCanvasId = canvasId
+  /* a fresh attempt for a (possibly different) id — any not-found from a
+     previous canvas must not leak into this one */
+  useStore.getState().setCanvasNotFound(false)
   open()
 }
 
@@ -34,8 +38,10 @@ function open() {
   s.onopen = () => {
     if (socket !== s) return
     const { clientId, name } = getIdentity()
-    useStore.getState().setConnected(true)
+    /* join first: flipping `connected` makes the Stage announce its camera,
+       and the server drops anything sent before the socket has a canvas */
     sendWs({ type: 'join', canvasId, clientId, name, kind: 'user' })
+    useStore.getState().setConnected(true)
   }
 
   s.onmessage = (ev) => {
@@ -65,6 +71,14 @@ function open() {
       location.href = '/'
       return
     }
+    if (ev.code === 4404) {
+      /* no such canvas — a typo'd id, or one that was just deleted. Stop
+         retrying (there is nothing to reconnect to) and let CanvasPage show
+         a not-found screen instead of an unresponsive, empty canvas UI. */
+      currentCanvasId = null
+      useStore.getState().setCanvasNotFound(true)
+      return
+    }
     if (currentCanvasId) {
       retryTimer = window.setTimeout(open, 1200)
     }
@@ -89,6 +103,7 @@ function handle(msg: ServerMessage) {
       s.setTasks(msg.tasks)
       s.setFeedback(msg.feedback)
       s.setComments(msg.comments)
+      s.setChat(msg.chat)
       s.setDecisions(msg.decisions)
       s.setProposals(msg.proposals)
       break
@@ -100,6 +115,9 @@ function handle(msg: ServerMessage) {
       break
     case 'cursor':
       s.setCursor(msg.clientId, msg.x, msg.y)
+      break
+    case 'viewport':
+      if (isPeerViewport(msg.viewport)) s.setPeerViewport(msg.clientId, msg.viewport)
       break
     case 'editing':
       s.setEditing(msg.clientId, msg.frameId)
@@ -155,6 +173,9 @@ function handle(msg: ServerMessage) {
       break
     case 'activity':
       s.pushActivity(msg.item)
+      break
+    case 'chat':
+      s.pushChat(msg.message)
       break
   }
 }

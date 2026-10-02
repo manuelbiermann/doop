@@ -13,6 +13,9 @@ import { PanelCollapseRightIcon } from './ui/icons'
 import { Input } from './ui/input'
 import { Dot } from './ui/dot'
 import { isResidentLimit } from './TeamAllowance'
+import { ChatPanel } from './ChatPanel'
+import { taskFrameId } from '../lib/taskFrame'
+import { useChatUnread } from '../lib/chatUnread'
 
 const emptyNote = 'px-4 py-6 text-center text-[13px] text-ink-faint'
 
@@ -43,6 +46,7 @@ export function ActivityPanel({
   const tab = useStore((s) => s.panelTab)
   const setTab = useStore((s) => s.setPanelTab)
   const [, tick] = useState(0)
+  const unread = useChatUnread()
 
   /* refresh relative timestamps and running durations */
   useEffect(() => {
@@ -56,6 +60,19 @@ export function ActivityPanel({
         <PanelHeader>
           <PanelTabs>
             <PanelTab value="tasks">Agents</PanelTab>
+            <PanelTab
+              value="chat"
+              className="relative"
+              title={unread ? `Chat · ${unread} new` : 'Talk to the room — @mention an agent to hand it a task'}
+            >
+              Chat
+              {/* new messages while another tab is open: a count on the tab itself */}
+              {unread > 0 && (
+                <span className="absolute -top-1 -right-1.5 grid h-[14px] min-w-[14px] place-items-center rounded-lg bg-accent-ink px-[3px] font-mono text-[8px] font-medium normal-case tracking-normal text-white">
+                  {unread > 99 ? '99+' : unread}
+                </span>
+              )}
+            </PanelTab>
             <PanelTab value="activity">Activity</PanelTab>
             <PanelTab
               value="memory"
@@ -78,6 +95,9 @@ export function ActivityPanel({
         </PanelHeader>
         <PanelTabPanel value="tasks">
           <TaskList />
+        </PanelTabPanel>
+        <PanelTabPanel value="chat">
+          <ChatPanel active={tab === 'chat'} />
         </PanelTabPanel>
         <PanelTabPanel value="activity">
           <ActivityList />
@@ -197,9 +217,33 @@ function TaskRow({ task }: { task: AgentTask }) {
 
   const state = task.endedAt ? 'done' : task.failedAt ? 'failed' : 'active'
 
+  /* clicking the task flies the camera to where the agent is (or was) working */
+  const frameId = useStore((s) => taskFrameId(task, s))
+  const frameName = useStore((s) => s.canvas?.frames.find((f) => f.id === frameId)?.name)
+  const goToFrame = () => {
+    if (frameId) useStore.getState().requestFlyTo(frameId)
+  }
+
   return (
     <div className="group">
-      <div className="flex animate-[chip-in_0.25s_ease] items-baseline gap-2 py-[5px] pr-4 pl-5 text-[12.5px] leading-[1.4]">
+      <div
+        role={frameId ? 'button' : undefined}
+        tabIndex={frameId ? 0 : undefined}
+        title={frameName ? `Go to “${frameName}”` : undefined}
+        onClick={goToFrame}
+        onKeyDown={(e) => {
+          if (e.target !== e.currentTarget) return
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault()
+            goToFrame()
+          }
+        }}
+        className={cn(
+          'flex animate-[chip-in_0.25s_ease] items-baseline gap-2 py-[5px] pr-4 pl-5 text-[12.5px] leading-[1.4]',
+          frameId &&
+            'cursor-pointer rounded-md hover:bg-paper-deep focus-visible:bg-paper-deep focus-visible:outline-none',
+        )}
+      >
         {task.failedAt ? (
           <span className="grid size-[15px] flex-none place-items-center self-center rounded-full bg-accent-ink text-[10px] font-extrabold text-white">
             !
@@ -236,7 +280,10 @@ function TaskRow({ task }: { task: AgentTask }) {
           <Button
             variant="danger-solid"
             size="pill"
-            onClick={() => api.retryCard(canvasId, task.id).catch(reportLimit)}
+            onClick={(e) => {
+              e.stopPropagation()
+              api.retryCard(canvasId, task.id).catch(reportLimit)
+            }}
           >
             ↻ Retry
           </Button>
@@ -247,7 +294,10 @@ function TaskRow({ task }: { task: AgentTask }) {
             size="sm"
             className="flex-none px-1 py-0 text-xs opacity-0 group-hover:opacity-100 focus-visible:opacity-100"
             title="Give the agent feedback on this task"
-            onClick={() => setReplying(true)}
+            onClick={(e) => {
+              e.stopPropagation()
+              setReplying(true)
+            }}
           >
             ↩
           </Button>

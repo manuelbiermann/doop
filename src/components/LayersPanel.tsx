@@ -17,11 +17,12 @@ import {
   buildLayerTree,
   elementHtml,
   filterLayers,
+  holdsChildren,
   type DropPlace,
   type DropTarget,
   type LayerNode,
 } from '../lib/layers'
-import { deleteLayer, duplicateLayer, moveLayer, shiftLayer } from '../lib/layerEdits'
+import { deleteLayer, dropLayer, duplicateLayer, shiftLayer } from '../lib/layerEdits'
 import { cn } from '@/lib/utils'
 import { AgentIcon } from './AgentIcon'
 import { LayerKindIcon } from './LayerKindIcon'
@@ -90,12 +91,14 @@ function holds(node: LayerNode, selector: string): boolean {
 }
 
 /** Where a drop over `row` lands — a line above or below it, or into it.
- *  Only boxes take children; an open box's lower part reads as "into" so the
- *  line under it always means "first child" rather than the ambiguous "after
- *  the subtree". A frame row is the top of its body. */
+ *  Only boxes that can hold children take an "into" drop (an <input> is a
+ *  box with nothing in it, but nothing can go in it); an open box's lower
+ *  part reads as "into" so the line under it always means "first child"
+ *  rather than the ambiguous "after the subtree". A frame row is the top of
+ *  its body. */
 function dropOver(row: VisibleRow, fraction: number): DropPlace {
   if (row.kind === 'frame') return 'inside'
-  if (row.node.kind !== 'box') return fraction < 0.5 ? 'before' : 'after'
+  if (row.node.kind !== 'box' || !holdsChildren(row.node.tag)) return fraction < 0.5 ? 'before' : 'after'
   if (fraction < EDGE_BAND) return 'before'
   if (!row.open && fraction > 1 - EDGE_BAND) return 'after'
   return 'inside'
@@ -206,10 +209,9 @@ export function LayersPanel({ onAddFrame }: { onAddFrame: () => void }) {
   /* a press on a layer row turns into a drag once it travels; the row is
      dropped where the pointer lets go, and the click that follows a drag is
      swallowed so the drop does not double as a select. The target is read
-     again at release (the list may have scrolled under a still pointer), the
-     frame is read from the store (a collaborator may have edited it during
-     the drag — moveLayer refuses selectors that no longer resolve), and a
-     cancelled gesture drops nothing. */
+     again at release (the list may have scrolled under a still pointer),
+     dropLayer checks the frame against the store (a collaborator may have
+     edited it during the drag), and a cancelled gesture drops nothing. */
   function onRowPointerDown(e: ReactPointerEvent<HTMLDivElement>, row: NodeVisibleRow) {
     if (e.button !== 0) return
     const start = { x: e.clientX, y: e.clientY }
@@ -242,8 +244,7 @@ export function LayersPanel({ onAddFrame }: { onAddFrame: () => void }) {
       if (!wasActive) return
       const target = dropAt(row, ev.clientX, ev.clientY)
       const over = target && rowsRef.current.find((r) => r.key === target.key)
-      const frame = useStore.getState().canvas?.frames.find((f) => f.id === row.frame.id)
-      if (over && target && frame) moveLayer(frame, row.node.selector, targetOf(over, target.place))
+      if (over && target) dropLayer(row.frame, row.node.selector, targetOf(over, target.place))
     }
     const onCancel = () => finish()
     window.addEventListener('pointermove', onMove)
@@ -290,6 +291,9 @@ export function LayersPanel({ onAddFrame }: { onAddFrame: () => void }) {
         break
       case 'Backspace':
       case 'Delete':
+        /* a held key repeats: once the element is gone the frame row would
+           be next, so only the first press deletes */
+        if (e.repeat) break
         if (row?.kind === 'frame') deleteFramesTracked([row.frame])
         else if (row) deleteLayer(row.frame, row.node.selector)
         break
@@ -297,6 +301,9 @@ export function LayersPanel({ onAddFrame }: { onAddFrame: () => void }) {
         return
     }
     e.preventDefault()
+    /* the canvas page listens for ⌫ on window and deletes the selected
+       frame — keys the tree handled must not reach it */
+    e.stopPropagation()
   }
 
   return (

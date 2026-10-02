@@ -38,7 +38,15 @@ describe('canvas access model', () => {
     expect((await fetch(`${BASE}/api/canvases`)).status).toBe(401)
     const mcp = await fetch(`${BASE}/mcp`, { method: 'POST', body: '{}' })
     expect(mcp.status).toBe(401)
-    expect(mcp.headers.get('www-authenticate')).toContain('oauth-protected-resource')
+    expect(mcp.headers.get('www-authenticate')).toContain(`${BASE}/.well-known/oauth-protected-resource/mcp`)
+  })
+
+  it('publishes protected-resource metadata naming the /mcp endpoint (RFC 9728)', async () => {
+    for (const path of ['/.well-known/oauth-protected-resource', '/.well-known/oauth-protected-resource/mcp']) {
+      const meta = await (await fetch(`${BASE}${path}`)).json()
+      expect(meta.resource).toBe(`${BASE}/mcp`)
+      expect(meta.authorization_servers).toEqual([BASE])
+    }
   })
 
   it('signs up three accounts and creates a canvas with a frame', async () => {
@@ -167,5 +175,13 @@ describe('canvas access model', () => {
     expect((await invited.delete(`/api/canvases/${canvasId}`)).status).toBe(403)
     expect((await owner.delete(`/api/canvases/${canvasId}`)).status).toBe(200)
     expect((await owner.get(`/api/canvases/${canvasId}`)).status).toBe(404)
+  })
+
+  /* https://github.com/kgoedecke/doop/issues/73 — joining an id that was never
+     a canvas (a typo'd URL, or one just deleted above) used to leave the
+     socket open with no 'init' and no close, so the client sat on a blank
+     canvas UI forever. The server should say clearly that it isn't there. */
+  it('closes the socket right away for a canvas id that does not exist', async () => {
+    expect(await owner.joinWs('this-canvas-id-was-never-created')).toEqual({ kind: 'closed', code: 4404 })
   })
 })

@@ -3,13 +3,23 @@ import { store } from './store.ts'
 import * as persist from './db/persist.ts'
 import * as thumbs from './thumbs.ts'
 import { colorFor } from '../shared/types.ts'
-import { DEFAULT_ROLE_ID, mentionedRole, normalizePipeline, roleByAgentName, roleName } from '../shared/agents.ts'
+import {
+  DEFAULT_ROLE_ID,
+  mentionedRole,
+  mentionedRoles,
+  normalizePipeline,
+  roleByAgentName,
+  roleName,
+  stripMentions,
+} from '../shared/agents.ts'
 import { decodeEscapedHtml, looksEscapedHtml, repairEscapedHtml } from './escapedHtml.ts'
 import type {
   Actor,
   ActorKind,
   ActivityItem,
   AgentTask,
+  CardScope,
+  ChatMessage,
   DesignDecision,
   ElementComment,
   Frame,
@@ -52,6 +62,7 @@ export function hydrateLogs(data: {
   tasks: Map<string, AgentTask[]>
   feedback: Map<string, TaskFeedback[]>
   comments: Map<string, ElementComment[]>
+  chat?: Map<string, ChatMessage[]>
   activity: Map<string, ActivityItem[]>
   decisions: Map<string, DesignDecision[]>
   proposals: Map<string, MemoryProposal[]>
@@ -59,6 +70,8 @@ export function hydrateLogs(data: {
   for (const [canvasId, list] of data.tasks) taskLog.set(canvasId, list)
   for (const [canvasId, list] of data.feedback) feedbackLog.set(canvasId, list)
   for (const [canvasId, list] of data.comments) commentLog.set(canvasId, list)
+  chatLog.clear()
+  for (const [canvasId, list] of data.chat ?? []) chatLog.set(canvasId, list)
   for (const [canvasId, list] of data.activity) activityLog.set(canvasId, list)
   for (const [canvasId, list] of data.decisions) decisionLog.set(canvasId, list)
   for (const [canvasId, list] of data.proposals) proposalLog.set(canvasId, list)
@@ -290,6 +303,97 @@ export function setAgentStatus(canvasId: string, actor: Actor, status: string) {
 /* ------------------------------------------------------------------ */
 
 const feedbackLog = new Map<string, TaskFeedback[]>() // canvasId -> entries (newest first)
+
+/* ---- canvas chat ---- */
+
+const chatLog = new Map<string, ChatMessage[]>() // canvasId -> messages (newest first)
+
+export const MAX_CHAT_CHARS = 4_000
+/** an agent's closing summary is a paragraph, not the whole transcript */
+const MAX_CHAT_REPLY_CHARS = 1_500
+
+export function getChat(canvasId: string): ChatMessage[] {
+  return chatLog.get(canvasId) ?? []
+}
+
+function pushChat(message: ChatMessage) {
+  const list = chatLog.get(message.canvasId) ?? []
+  list.unshift(message)
+  const dropped = list.splice(persist.CHAT_LOG_CAP).map((m) => m.id)
+  chatLog.set(message.canvasId, list)
+  persist.saveChat(message)
+  persist.deleteChat(dropped)
+  broadcast(message.canvasId, { type: 'chat', message })
+}
+
+/** A human says something in the canvas chat. @mentioning resident agents
+ *  turns the message into a board card for them, in mention order — the
+ *  message keeps the card's id so the chat can show where the work stands. */
+export function addChatMessage(
+  canvasId: string,
+  text: string,
+  from: string,
+  fromUserId?: string,
+): ChatMessage | undefined {
+  const clean = text.trim().slice(0, MAX_CHAT_CHARS)
+  if (!clean || !store.getCanvas(canvasId)) return undefined
+  const roles = mentionedRoles(clean)
+  const card =
+    roles.length > 0
+      ? addQueuedCard(
+          canvasId,
+          stripMentions(clean) || clean,
+          from,
+          roles.map((r) => r.id),
+          undefined,
+          fromUserId,
+        )
+      : undefined
+  const list = chatLog.get(canvasId) ?? []
+  const message: ChatMessage = {
+    id: nanoid(8),
+    canvasId,
+    from,
+    fromKind: 'user',
+    ...(fromUserId ? { fromUserId } : {}),
+    color: colorFor(from),
+    text: clean,
+    /* strictly increasing per canvas so the thread order survives a restart */
+    at: Math.max(Date.now(), (list[0]?.at ?? 0) + 1),
+    ...(roles.length > 0 ? { mentions: roles.map((r) => r.id) } : {}),
+    ...(card ? { taskId: card.id } : {}),
+  }
+  pushChat(message)
+  return message
+}
+
+/** An agent answers the chat message that queued one of its cards. Nothing
+ *  is posted for cards that came from the board — those have no thread. */
+export function chatReplyForCard(
+  canvasId: string,
+  cardId: string,
+  actor: Actor,
+  text: string,
+): ChatMessage | undefined {
+  const asked = (chatLog.get(canvasId) ?? []).find((m) => m.taskId === cardId && m.fromKind === 'user')
+  if (!asked) return undefined
+  const clean = text.replace(/\s+/g, ' ').trim()
+  if (!clean) return undefined
+  const list = chatLog.get(canvasId) ?? []
+  const message: ChatMessage = {
+    id: nanoid(8),
+    canvasId,
+    from: actor.name,
+    fromKind: 'agent',
+    color: actor.color,
+    text: clean.length > MAX_CHAT_REPLY_CHARS ? clean.slice(0, MAX_CHAT_REPLY_CHARS - 1) + '…' : clean,
+    at: Math.max(Date.now(), (list[0]?.at ?? 0) + 1),
+    taskId: cardId,
+    replyToId: asked.id,
+  }
+  pushChat(message)
+  return message
+}
 
 export function getFeedback(canvasId: string): TaskFeedback[] {
   return feedbackLog.get(canvasId) ?? []
@@ -649,11 +753,31 @@ export function hasAnnouncedTask(canvasId: string, actor: Actor): boolean {
   return (taskLog.get(canvasId) ?? []).some((t) => sameAgent(t, actor) && !t.endedAt && !t.auto)
 }
 
+/** How many frames a task remembers — the Agents panel only ever jumps to the
+ *  latest one; the rest are history for a sweeping multi-frame task. */
+const TASK_FRAMES_CAP = 20
+
+/** Note that the agent's open tasks touched a frame (most recent last), so a
+ *  click on the task in the Agents panel can fly the camera there. A claimed
+ *  card and a set_status task can be open side by side — both are the work. */
+function trackTaskFrame(canvasId: string, actor: Actor, frameId: string) {
+  for (const open of taskLog.get(canvasId) ?? []) {
+    if (!sameAgent(open, actor) || open.endedAt) continue
+    if (open.frameIds?.at(-1) === frameId) continue
+    open.frameIds = [...(open.frameIds ?? []).filter((id) => id !== frameId), frameId].slice(-TASK_FRAMES_CAP)
+    persist.saveTask(canvasId, open)
+    broadcast(canvasId, { type: 'task', task: open })
+  }
+}
+
 /* Agents that never call set_status still get a task inferred from what
    they are visibly doing, so the Tasks panel is never silently empty. */
-function autoTask(canvasId: string, actor: Actor, status: string) {
+function autoTask(canvasId: string, actor: Actor, status: string, frameId: string) {
   const list = taskLog.get(canvasId) ?? []
-  if (list.some((t) => sameAgent(t, actor) && !t.endedAt)) return // any open task wins
+  if (list.some((t) => sameAgent(t, actor) && !t.endedAt)) {
+    trackTaskFrame(canvasId, actor, frameId) // any open task wins — it just gains the frame
+    return
+  }
   const task: AgentTask = {
     id: nanoid(8),
     agentName: actor.name,
@@ -662,6 +786,7 @@ function autoTask(canvasId: string, actor: Actor, status: string) {
     status,
     startedAt: Date.now(),
     auto: true,
+    frameIds: [frameId],
   }
   list.unshift(task)
   if (list.length > 100) list.length = 100
@@ -707,6 +832,19 @@ export function endAgentTasks(canvasId: string, agentName: string) {
  *  a pasted document from being stored, broadcast and prompted verbatim. */
 export const MAX_CARD_CHARS = 4_000
 
+const MAX_SELECTOR_CHARS = 1_000
+
+/** The frame (and optional element) a prompt is scoped to — only a frame
+ *  that lives on this canvas counts, and a selector rides along only with
+ *  its frame. Anything else queues as an unscoped card. */
+function normalizeScope(canvasId: string, scope: unknown): CardScope | undefined {
+  if (!scope || typeof scope !== 'object') return undefined
+  const { frameId, selector } = scope as Record<string, unknown>
+  if (typeof frameId !== 'string' || store.getFrame(frameId)?.canvasId !== canvasId) return undefined
+  const sel = typeof selector === 'string' ? selector.trim().slice(0, MAX_SELECTOR_CHARS) : ''
+  return sel ? { frameId, selector: sel } : { frameId }
+}
+
 export function addQueuedCard(
   canvasId: string,
   title: string,
@@ -714,10 +852,12 @@ export function addQueuedCard(
   agents?: unknown,
   attachments?: unknown,
   fromUserId?: string,
+  scope?: unknown,
 ): AgentTask | undefined {
   const clean = title.trim().slice(0, MAX_CARD_CHARS)
   if (!clean || !store.getCanvas(canvasId)) return undefined
   const pipeline = normalizePipeline(agents)
+  const target = normalizeScope(canvasId, scope)
   /* reference-image frame ids: only frames that actually live on this canvas */
   const refs = (Array.isArray(attachments) ? attachments : [])
     .filter((a): a is string => typeof a === 'string')
@@ -730,7 +870,8 @@ export function addQueuedCard(
       !t.endedAt &&
       t.status === clean &&
       pipelineOf(t).join(',') === pipeline.join(',') &&
-      (t.attachments ?? []).join(',') === refs.join(','),
+      (t.attachments ?? []).join(',') === refs.join(',') &&
+      JSON.stringify(t.scope ?? null) === JSON.stringify(target ?? null),
   )
   if (duplicate) return duplicate
   const card: AgentTask = {
@@ -744,6 +885,7 @@ export function addQueuedCard(
     pipeline,
     stage: 0,
     ...(refs.length > 0 ? { attachments: refs } : {}),
+    ...(target ? { scope: target } : {}),
   }
   list.unshift(card)
   taskLog.set(canvasId, trimTaskLog(list))
@@ -757,6 +899,14 @@ export function addQueuedCard(
   /* the resident agents pick queued cards up instantly (no-op without a key) */
   import('./resident.ts').then((r) => r.onFeedback(canvasId)).catch(() => {})
   return card
+}
+
+/** Publish a board card already committed by a durable integration job. */
+export function publishQueuedCard(canvasId: string, card: AgentTask): void {
+  const list = taskLog.get(canvasId) ?? []
+  if (list.some((task) => task.id === card.id)) return
+  taskLog.set(canvasId, trimTaskLog([card, ...list]))
+  broadcast(canvasId, { type: 'task', task: card })
 }
 
 const TASK_LOG_CAP = 100
@@ -1085,7 +1235,7 @@ export function appendFrameHtml(
     streams.set(frameId, { actor, escaped, lastActivity: Date.now() })
     broadcast(frame.canvasId, { type: 'frame:streaming', frameId, active: true, actor })
     logActivity(frame.canvasId, actor, `is designing “${frame.name}” live…`, frameId)
-    autoTask(frame.canvasId, actor, `Designing “${frame.name}”`)
+    autoTask(frame.canvasId, actor, `Designing “${frame.name}”`, frameId)
   }
   const s = streams.get(frameId)!
   s.lastActivity = Date.now()
@@ -1117,7 +1267,7 @@ export function createFrame(
     /* agent one-shot creation still plays back as a reveal */
     broadcast(canvasId, { type: 'frame:created', frame: { ...frame, html: '' }, actor })
     startReveal(frame, actor, 0)
-    autoTask(canvasId, actor, `Designing “${frame.name}”`)
+    autoTask(canvasId, actor, `Designing “${frame.name}”`, frame.id)
   } else {
     broadcast(canvasId, { type: 'frame:created', frame, actor })
   }
@@ -1151,14 +1301,15 @@ export function updateFrame(
       openReveal.actor = actor
       openReveal.shown = Math.min(openReveal.shown, prefix)
       openReveal.deadline = Date.now() + revealDuration(frame.html.length - openReveal.shown)
+      trackTaskFrame(frame.canvasId, actor, frameId)
     } else if (smallTweak) {
       broadcast(frame.canvasId, { type: 'frame:updated', frame, actor })
       logActivity(frame.canvasId, actor, `tweaked the design of “${frame.name}”`, frame.id)
-      autoTask(frame.canvasId, actor, `Tweaking “${frame.name}”`)
+      autoTask(frame.canvasId, actor, `Tweaking “${frame.name}”`, frameId)
     } else {
       startReveal(frame, actor, prefix)
       logActivity(frame.canvasId, actor, `updated the design of “${frame.name}”`, frame.id)
-      autoTask(frame.canvasId, actor, `Redesigning “${frame.name}”`)
+      autoTask(frame.canvasId, actor, `Redesigning “${frame.name}”`, frameId)
     }
   } else {
     if (htmlChanged) {
@@ -1201,6 +1352,7 @@ export function deleteCanvas(canvasId: string): boolean {
   taskLog.delete(canvasId)
   feedbackLog.delete(canvasId)
   commentLog.delete(canvasId)
+  chatLog.delete(canvasId)
   activityLog.delete(canvasId)
   decisionLog.delete(canvasId)
   proposalLog.delete(canvasId)

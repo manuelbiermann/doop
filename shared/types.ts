@@ -1,3 +1,5 @@
+import type { BillingInterval, WorkspaceStatus } from './billing.ts'
+
 export interface Frame {
   id: string
   canvasId: string
@@ -22,6 +24,8 @@ export interface CanvasMeta {
   ownerId?: string
   /** true when this canvas is on the list because the user was invited */
   shared?: boolean
+  /** the shared workspace it lives in; unset = a personal canvas */
+  workspaceId?: string
   createdAt: number
   updatedAt: number
   frameCount: number
@@ -80,6 +84,10 @@ export interface Canvas {
   linkAccess?: 'edit' | 'none'
   /** user ids invited to collaborate (the owner is not listed) */
   memberIds?: string[]
+  /** the shared workspace this canvas belongs to — every workspace member
+   *  can open it, on top of the owner and invited members. Unset = the
+   *  owner's personal space. */
+  workspaceId?: string
   /** set while the owner lists this canvas in the community gallery. The
    *  gallery shows previews and hands out copies — it never opens the
    *  canvas itself, so publishing does not change who can edit it. */
@@ -97,6 +105,68 @@ export interface Canvas {
   guidelines?: GuidelineDoc[]
   /** frames pinned to Memory as style exemplars — HTML snapshotted at pin time */
   references?: MemoryReference[]
+}
+
+/* ---- workspaces ---- */
+
+export const WORKSPACE_ROLES = ['owner', 'admin', 'member'] as const
+export type WorkspaceRole = (typeof WORKSPACE_ROLES)[number]
+
+export function isWorkspaceRole(value: unknown): value is WorkspaceRole {
+  return typeof value === 'string' && (WORKSPACE_ROLES as readonly string[]).includes(value)
+}
+
+/** A workspace as the dashboard lists it — for one viewer, hence `role`. */
+export interface WorkspaceSummary {
+  id: string
+  name: string
+  ownerId: string
+  /** the viewer's role in it */
+  role: WorkspaceRole
+  status: WorkspaceStatus
+  /** true when members may grow it: no billing on this server, or a live
+   *  subscription. Canvases inside stay reachable either way. */
+  active: boolean
+  plan: 'team' | null
+  interval: BillingInterval | null
+  /** seats Stripe is billing for right now */
+  seats: number
+  memberCount: number
+  canvasCount: number
+  /** next renewal (or the end, when cancelAtPeriodEnd) — epoch ms */
+  currentPeriodEnd?: number
+  cancelAtPeriodEnd: boolean
+  createdAt: number
+  updatedAt: number
+}
+
+export interface WorkspaceMember {
+  userId: string
+  name: string
+  email: string
+  role: WorkspaceRole
+  addedAt: number
+}
+
+/** An outstanding invite to an email with no doop account yet. */
+export interface WorkspaceInvite {
+  id: string
+  email: string
+  role: WorkspaceRole
+  invitedByName: string
+  createdAt: number
+}
+
+export interface WorkspaceDetail extends WorkspaceSummary {
+  members: WorkspaceMember[]
+  /** only admins and the owner see these */
+  invites: WorkspaceInvite[]
+  billing: {
+    /** Stripe is configured on this server — plans can be bought */
+    enabled: boolean
+    /** a Stripe customer exists, so the billing portal can open */
+    portal: boolean
+  }
 }
 
 /* ---- design memory ---- */
@@ -193,6 +263,9 @@ export interface Presence {
   color: string
   kind: ActorKind
   cursor?: { x: number; y: number }
+  /** the region of the canvas this client is looking at — pan/zoom plus the
+   *  stage size, so a follower can fit the same world rect on its own screen */
+  viewport?: PeerViewport
   activeFrameId?: string | null
   /** one-line "what I'm working on right now" (agents set this via set_status) */
   status?: string
@@ -215,6 +288,9 @@ export interface AgentTask {
   endedAt?: number
   /** inferred by the server from frame edits (agent never called set_status) */
   auto?: boolean
+  /** frames the agent edited while this task was open, most recent last —
+   *  lets the Agents panel jump the camera to where the work happened */
+  frameIds?: string[]
   /** human who queued this as a board card */
   queuedBy?: string
   /** account id of that human — decides which model credential runs the card */
@@ -230,10 +306,19 @@ export interface AgentTask {
   attachments?: string[]
   /** index into pipeline of the stage that is queued or running right now */
   stage?: number
+  /** board cards: the frame (and optionally the element inside it) the human
+   *  had selected when they asked — the agent edits that in place */
+  scope?: CardScope
   /** structured board cards the resident runner dispatches on, instead of
    *  handing the title to the chat agent. Absent on prompt cards. */
   kind?: RepoCardKind
   payload?: RepoCardPayload
+}
+
+export interface CardScope {
+  frameId: string
+  /** element selector inside the frame (frameRuntime cssPath); absent = whole frame */
+  selector?: string
 }
 
 export type RepoCardKind = 'sketch' | 'design-system'
@@ -317,6 +402,28 @@ export interface ElementComment {
   parentId?: string
 }
 
+/** One line in the canvas chat: a human or agent talking to the room. A
+ *  message that @mentions resident agents also queues a board card for them
+ *  (linked through `taskId`), so a request typed in the chat is assigned the
+ *  moment it is sent, and the agents answer back in the same thread. */
+export interface ChatMessage {
+  id: string
+  canvasId: string
+  from: string
+  fromKind: ActorKind
+  /** account id of the human who wrote it — decides which model credential runs the card */
+  fromUserId?: string
+  color: string
+  text: string
+  at: number
+  /** role ids the text @mentions, in order — the pipeline of the queued card */
+  mentions?: string[]
+  /** the board card this message queued, when it addressed an agent */
+  taskId?: string
+  /** an agent's answer: the message it replies to */
+  replyToId?: string
+}
+
 export interface ActivityItem {
   id: string
   actorName: string
@@ -327,11 +434,21 @@ export interface ActivityItem {
   at: number
 }
 
+/** A client's camera: world→screen transform plus the stage size it fills. */
+export interface PeerViewport {
+  x: number
+  y: number
+  zoom: number
+  width: number
+  height: number
+}
+
 /* ---- websocket protocol ---- */
 
 export type ClientMessage =
   | { type: 'join'; canvasId: string; clientId: string; name: string; kind: ActorKind }
   | { type: 'cursor'; x: number; y: number }
+  | { type: 'viewport'; viewport: PeerViewport }
   | { type: 'editing'; frameId: string | null }
   | { type: 'frame:drag'; frameId: string; x: number; y: number; width: number; height: number }
 
@@ -344,6 +461,7 @@ export type ServerMessage =
       tasks: AgentTask[]
       feedback: TaskFeedback[]
       comments: ElementComment[]
+      chat: ChatMessage[]
       decisions: DesignDecision[]
       proposals: MemoryProposal[]
       selfColor: string
@@ -353,11 +471,13 @@ export type ServerMessage =
   | { type: 'presence:join'; presence: Presence }
   | { type: 'presence:leave'; clientId: string }
   | { type: 'cursor'; clientId: string; x: number; y: number }
+  | { type: 'viewport'; clientId: string; viewport: PeerViewport }
   | { type: 'editing'; clientId: string; frameId: string | null }
   | { type: 'status'; clientId: string; status: string | null }
   | { type: 'task'; task: AgentTask }
   | { type: 'feedback'; feedback: TaskFeedback }
   | { type: 'comment'; comment: ElementComment }
+  | { type: 'chat'; message: ChatMessage }
   | { type: 'frame:drag'; clientId: string; frameId: string; x: number; y: number; width: number; height: number }
   | { type: 'frame:created'; frame: Frame; actor: Actor }
   | { type: 'frame:updated'; frame: Frame; actor: Actor }

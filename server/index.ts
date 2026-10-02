@@ -1,3 +1,6 @@
+import { localAgentRouter, handleLocalAgentMcp } from './localAgent.ts'
+import { handleGeminiCloudMcp } from './geminiCloudMcp.ts'
+import { geminiCloudWorkerFor } from './geminiCloudRuns.ts'
 import http from 'node:http'
 import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
@@ -10,12 +13,15 @@ import { WebSocketServer, WebSocket } from 'ws'
 import { store } from './store.ts'
 import { getImage } from './previews.ts'
 import * as actions from './actions.ts'
-import { canAccessCanvas, hasDurableCanvasAccess, isAdmin } from './access.ts'
+import { canAccessCanvas, canManageCanvas, hasDurableCanvasAccess, isAdmin } from './access.ts'
 import { auth, initAuth, syncAdmins, getUserName, PUBLIC_ORIGIN, loginProvidersConfig } from './auth.ts'
 import { adminRouter } from './admin.ts'
 import { communityRouter, parseListing, publishableFrames } from './community.ts'
 import { automationsRouter, startScheduler } from './automations.ts'
 import { integrationsRouter } from './integrations.ts'
+import { extensions } from './extensions.ts'
+import * as workspaces from './workspaces.ts'
+import * as billing from './billing.ts'
 import * as demo from './demo.ts'
 import { db, initDb } from './db/index.ts'
 import * as authSchema from './db/auth-schema.ts'
@@ -30,6 +36,7 @@ import {
   MAX_ASSET_BYTES,
 } from './assets.ts'
 import * as ingest from './ingest.ts'
+import * as agentKeys from './agentKeys.ts'
 import * as backgrounds from './backgrounds.ts'
 import * as storage from './storage.ts'
 import * as github from './github.ts'
@@ -37,11 +44,17 @@ import * as githubApp from './githubApp.ts'
 import { seed } from './seed.ts'
 import * as allowance from './allowance.ts'
 import * as modelAccounts from './modelAccounts.ts'
+import { getLocalAgentPreference, saveLocalAgentPreference } from './localAgentPreferences.ts'
 import { serverTierInfo } from './agentModel.ts'
-import { serverImageGenEnabled } from './imageGen.ts'
+import { imageModelAvailability, serverImageGenEnabled } from './imageGen.ts'
+import { setImagePref } from './imagePrefs.ts'
 import { AGENT_MODELS } from './openaiAgent.ts'
+import { CLAUDE_MODELS } from '../shared/localAgent.ts'
+import { GEMINI_MODELS, OPENROUTER_MODELS } from '../shared/modelMenu.ts'
+import type { ModelOption } from '../shared/modelMenu.ts'
 import { mentionedRole } from '../shared/agents.ts'
 import { colorFor } from '../shared/types.ts'
+import { isPeerViewport } from '../shared/viewport.ts'
 import type { ClientMessage, Presence, ServerMessage } from '../shared/types.ts'
 
 const PORT = Number(process.env.PORT || 4400)
@@ -71,6 +84,8 @@ if (data.canvases.length === 0 && (await persist.importLegacyJson())) {
   data = await persist.hydrate()
 }
 store.init(data.canvases)
+await workspaces.hydrateWorkspaces() // before the first request: canAccessCanvas reads membership
+billing.reportBillingConfig()
 actions.hydrateLogs(data)
 seed()
 
@@ -464,7 +479,27 @@ app.all('/api/auth/*', async (req, res, next) => {
   toNodeHandler(auth)(req, res).catch(next)
 })
 
+/* Stripe webhooks: the signature covers the exact bytes, so this route takes
+   the raw body and sits ahead of the JSON parser; no session — Stripe is the
+   caller. Everything it does is in server/workspaces.ts. */
+app.post('/stripe/webhook', express.raw({ type: '*/*', limit: '1mb' }), (req, res) => {
+  workspaces.handleStripeWebhook(req, res).catch((err) => {
+    console.error('[billing] webhook crashed', err)
+    if (!res.headersSent) res.status(500).json({ error: 'webhook handling failed' })
+  })
+})
+
+for (const extension of extensions) {
+  if (extension.webhookRouter) app.use(`/webhooks/${extension.id}`, extension.webhookRouter())
+}
+
 app.use(express.json({ limit: '10mb' }))
+app.all('/gemini-cloud/mcp/:id', (req, res, next) => {
+  handleGeminiCloudMcp(req, res).catch(next)
+})
+app.all('/local-agent/mcp/:id', (req, res, next) => {
+  handleLocalAgentMcp(req, res).catch(next)
+})
 
 /* Public: does an account exist for this email? Drives the login page's
    "no account found — sign up instead" prompt. Existence is already
@@ -552,6 +587,8 @@ app.get('/api/me', async (req, res) => {
     name,
     email,
     admin: isAdmin(req.user),
+    /* 'team' while a member of a live paid workspace — the account menu's plan line */
+    plan: workspaces.planFor(id),
     /* the SPA cannot infer this: impersonation swaps the session cookie
        outright, so everything else on this response describes the person
        being viewed, not the admin doing the viewing */
@@ -589,10 +626,13 @@ function requireFrame(req: express.Request, res: express.Response, frameId: stri
   return frame
 }
 
+app.use('/api/local-agent', localAgentRouter)
 app.use('/api/admin', adminRouter)
 app.use('/api/community', communityRouter)
 app.use('/api/automations', automationsRouter)
 app.use('/api/integrations', integrationsRouter)
+app.use('/api/workspaces', workspaces.workspacesRouter)
+app.use('/api/billing', billing.billingRouter)
 
 /* free-tier meter for the resident team: {used, limit, connected, byoModel} */
 app.get('/api/agent-allowance', (req, res) => {
@@ -605,11 +645,21 @@ app.get('/api/agent-allowance', (req, res) => {
 /* ---- the user's own model account: what keeps the Doop Agent running once
    the free tasks are gone. Tokens live server-side and are never returned. */
 
+/* one curated menu per account kind, with the vision flag the picker renders;
+   the pre-roster providers all see images */
+const MODEL_MENUS: Record<modelAccounts.AccountKind, ModelOption[]> = {
+  chatgpt: AGENT_MODELS.map((m) => ({ ...m, vision: true })),
+  'openai-key': AGENT_MODELS.map((m) => ({ ...m, vision: true })),
+  'anthropic-key': CLAUDE_MODELS.map((m) => ({ ...m, vision: true })),
+  'openrouter-key': OPENROUTER_MODELS,
+  'gemini-key': GEMINI_MODELS,
+}
+
 /* Every route that returns an account status returns the SAME shape: the
-   client re-renders straight from the response, so dropping the model list on
+   client re-renders straight from the response, so dropping the menus on
    a PATCH would collapse the picker until the next reload. */
 function accountView(status: modelAccounts.AccountStatus) {
-  return { ...status, chatgptEnabled: modelAccounts.chatgptConnectEnabled(), models: AGENT_MODELS }
+  return { ...status, chatgptEnabled: modelAccounts.chatgptConnectEnabled(), menus: MODEL_MENUS }
 }
 
 app.get('/api/model-account', (req, res) => {
@@ -692,14 +742,91 @@ app.post('/api/model-account/openai-key', async (req, res) => {
   }
 })
 
+app.post('/api/model-account/anthropic-key', async (req, res) => {
+  try {
+    const previous = await modelAccounts.getAccount(req.user!.id)
+    const status = await modelAccounts.connectAnthropicKey(req.user!.id, String(req.body?.apiKey ?? ''))
+    if (previous?.kind !== 'anthropic-key') {
+      const preference = await getLocalAgentPreference(req.user!.id)
+      await saveLocalAgentPreference(req.user!.id, { ...preference, enabled: false })
+    }
+    res.json(accountView(status))
+  } catch (e) {
+    res.status(400).json({ error: e instanceof Error ? e.message : 'could not save that API key' })
+  }
+})
+
+/* the two wide-roster keys share the anthropic-key route's shape, including
+   switching off the local-CLI preference so the new account is not shadowed */
+for (const kind of ['openrouter-key', 'gemini-key'] as const) {
+  const connect = kind === 'openrouter-key' ? modelAccounts.connectOpenRouterKey : modelAccounts.connectGeminiKey
+  app.post(`/api/model-account/${kind}`, async (req, res) => {
+    try {
+      const previous = await modelAccounts.getAccount(req.user!.id)
+      const status = await connect(req.user!.id, String(req.body?.apiKey ?? ''))
+      if (previous?.kind !== kind) {
+        const preference = await getLocalAgentPreference(req.user!.id)
+        await saveLocalAgentPreference(req.user!.id, { ...preference, enabled: false })
+      }
+      res.json(accountView(status))
+    } catch (e) {
+      res.status(400).json({ error: e instanceof Error ? e.message : 'could not save that API key' })
+    }
+  })
+}
+
 app.delete('/api/model-account', async (req, res) => {
   await modelAccounts.disconnect(req.user!.id)
   res.json(accountView({ connected: false }))
 })
 
+/* ---- which image model generate_image draws with (the shared registry;
+   entries the payer cannot run are shown but disabled) */
+
+app.get('/api/image-model', (req, res) => {
+  imageModelAvailability(req.user!.id)
+    .then((models) => res.json({ models }))
+    .catch(() => res.status(500).json({ error: 'image models unavailable' }))
+})
+
+app.put('/api/image-model', async (req, res) => {
+  try {
+    const model = String(req.body?.model ?? '')
+    const models = await imageModelAvailability(req.user!.id)
+    const entry = models.find((m) => m.id === model)
+    if (!entry) throw new Error('unknown image model')
+    if (!entry.available) throw new Error('that image model is not available on your account or this server')
+    await setImagePref(req.user!.id, model)
+    res.json({ models: await imageModelAvailability(req.user!.id) })
+  } catch (e) {
+    res.status(400).json({ error: e instanceof Error ? e.message : 'could not change the image model' })
+  }
+})
+
+/* ---- Agent keys: account-scoped bearer credentials for /mcp, the headless
+   agent path (see server/agentKeys.ts). The secret appears exactly once, in
+   the create response; the list carries only each key's start. The /api
+   session gate above means impersonating admins can look but not mint. */
+
+app.get('/api/agent-keys', async (req, res) => {
+  res.json(await agentKeys.listAgentKeys(req.user!.id))
+})
+
+app.post('/api/agent-keys', async (req, res) => {
+  const key = await agentKeys.createAgentKey(req.user!.id, String(req.body?.name ?? ''))
+  if (!key) return res.status(400).json({ error: 'agent key limit reached — revoke one you no longer use' })
+  res.json(key)
+})
+
+app.delete('/api/agent-keys/:id', async (req, res) => {
+  if (!(await agentKeys.deleteAgentKey(req.user!.id, req.params.id)))
+    return res.status(404).json({ error: 'agent key not found' })
+  res.json({ ok: true })
+})
+
 app.get('/api/canvases', (req, res) =>
   res.json(
-    store.listCanvases(req.user!.id).map((c) => {
+    workspaces.canvasesFor(req.user!.id).map((c) => {
       /* which agents have worked on this canvas (most recent first), with
          the user whose token they connected under and when they last worked */
       const seen = new Map<string, { owner?: string; lastAt: number }>()
@@ -712,17 +839,41 @@ app.get('/api/canvases', (req, res) =>
   ),
 )
 
+/* A workspace canvas needs membership and a workspace that may still grow —
+   the 402 is what every client turns into the upgrade modal. */
+function requireGrowableWorkspace(req: express.Request, res: express.Response, workspaceId: string) {
+  const ws = workspaces.getWorkspace(workspaceId)
+  if (!ws || !workspaces.isWorkspaceMember(ws.id, req.user!.id)) {
+    res.status(404).json({ error: 'workspace not found' })
+    return null
+  }
+  if (!workspaces.isActive(ws)) {
+    workspaces.planRequired(res, ws)
+    return null
+  }
+  return ws
+}
+
 app.post('/api/canvases', (req, res) => {
   const name = String(req.body?.name || 'Untitled canvas')
-  res.json(store.createCanvas(name, req.user!.id))
+  const workspaceId = typeof req.body?.workspaceId === 'string' ? req.body.workspaceId : undefined
+  if (workspaceId && !requireGrowableWorkspace(req, res, workspaceId)) return
+  res.json(store.createCanvas(name, req.user!.id, workspaceId))
 })
 
 app.post('/api/canvases/:id/duplicate', async (req, res) => {
   const source = store.getCanvas(req.params.id)
   if (!source) return res.status(404).json({ error: 'not found' })
   if (!hasDurableCanvasAccess(req.user!.id, source)) return res.status(403).json({ error: 'access denied' })
+  /* a copy stays in the workspace when the copier is a member of it and the
+     workspace may still take canvases; otherwise it lands in their personal space */
+  const sourceWs = source.workspaceId ? workspaces.getWorkspace(source.workspaceId) : undefined
+  const workspaceId =
+    sourceWs && workspaces.isWorkspaceMember(sourceWs.id, req.user!.id) && workspaces.isActive(sourceWs)
+      ? sourceWs.id
+      : undefined
   try {
-    const copy = await store.duplicateCanvas(source.id, req.user!.id, req.user!.name)
+    const copy = await store.duplicateCanvas(source.id, req.user!.id, req.user!.name, { workspaceId })
     res.json(copy)
   } catch (error) {
     console.error('[canvas] duplicate failed', error)
@@ -756,6 +907,31 @@ app.delete('/api/canvases/:id/publish', (req, res) => {
   res.json({ ok: true })
 })
 
+/* Move a canvas into a workspace (its owner, who must be a member, while it
+   may grow) or back out to its owner's personal space (the owner, or a
+   workspace admin). Moving is an access change, not an edit: every member
+   of the target workspace can open it from now on. */
+app.put('/api/canvases/:id/workspace', (req, res) => {
+  const c = requireCanvas(req, res, req.params.id)
+  if (!c) return
+  const target = req.body?.workspaceId
+  if (target !== null && typeof target !== 'string')
+    return res.status(400).json({ error: 'workspaceId must be a workspace id or null' })
+  if (!canManageCanvas(req.user!.id, c))
+    return res.status(403).json({ error: 'only the canvas owner or a workspace admin can move it' })
+  if (target !== null) {
+    if (target === c.workspaceId) return res.json({ ok: true })
+    /* an admin's say over a workspace canvas ends at moving it out: re-homing
+       it into another workspace — one the owner may not even belong to — is
+       the owner's call alone */
+    if (c.ownerId !== req.user!.id)
+      return res.status(403).json({ error: 'only the canvas owner can move it into a workspace' })
+    if (!requireGrowableWorkspace(req, res, target)) return
+  }
+  store.setWorkspace(c.id, target ?? undefined)
+  res.json({ ok: true })
+})
+
 app.post('/api/canvases/:id/claim', (req, res) => {
   const c = store.claimCanvas(req.params.id, req.user!.id)
   if (!c) return res.status(409).json({ error: 'not found or already owned' })
@@ -764,7 +940,7 @@ app.post('/api/canvases/:id/claim', (req, res) => {
 
 /* recent activity across all of the user's canvases, for the home dashboard */
 app.get('/api/home/activity', (req, res) => {
-  const canvases = store.listCanvases(req.user!.id)
+  const canvases = workspaces.canvasesFor(req.user!.id)
   const items = canvases.flatMap((c) =>
     actions
       .getActivity(c.id)
@@ -778,9 +954,11 @@ app.get('/api/home/activity', (req, res) => {
 app.delete('/api/canvases/:id', (req, res) => {
   const c = store.getCanvas(req.params.id)
   if (!c) return res.status(404).json({ error: 'not found' })
-  /* only the owner may delete; unclaimed (legacy) canvases are reachable
-     only by direct link and must be claimed before they can be destroyed */
-  if (c.ownerId !== req.user!.id) return res.status(403).json({ error: c.ownerId ? 'not yours' : 'claim it first' })
+  /* only the owner (or an admin of its workspace) may delete; unclaimed
+     (legacy) canvases are reachable only by direct link and must be claimed
+     before they can be destroyed */
+  if (!c.ownerId) return res.status(403).json({ error: 'claim it first' })
+  if (!canManageCanvas(req.user!.id, c)) return res.status(403).json({ error: 'not yours' })
   actions.deleteCanvas(c.id)
   res.json({ ok: true })
 })
@@ -1055,6 +1233,14 @@ async function withConnectionLock<T>(connectionId: string, fn: () => Promise<T>)
 app.post('/api/canvases/:id/github/:connId/import', async (req, res) => {
   const c = requireDurableCanvas(req, res, req.params.id)
   if (!c) return
+  // The pilot owns this user's routing. Reject before analysis, metering or
+  // queueing instead of accepting cards that its canvas-only harness cannot run.
+  if (geminiCloudWorkerFor(req.user!.id)) {
+    return res.status(409).json({
+      error:
+        'Repository imports are unavailable while the Gemini cloud pilot is selected. Ask your operator to disable the pilot, then select a provider that supports repository imports.',
+    })
+  }
   const conn = await github.getConnection(c.id, req.params.connId)
   if (!conn) return res.status(404).json({ error: 'connection not found' })
   if (!takeImportSlot(req.user!.id)) return res.status(429).json({ error: 'too many imports — wait a minute' })
@@ -1423,9 +1609,31 @@ app.post('/api/canvases/:id/cards', async (req, res) => {
     req.body?.agents,
     req.body?.attachments,
     req.user!.id,
+    req.body?.scope,
   )
   if (!card) return res.status(404).json({ error: 'canvas not found or empty title' })
   res.json(card)
+})
+
+/* the canvas chat: a plain message is free; one that @mentions resident
+   agents queues a card for them and is metered like any other card */
+app.post('/api/canvases/:id/chat', async (req, res) => {
+  if (!requireCanvas(req, res, req.params.id)) return
+  /* the same cut addChatMessage applies, so a mention past the cap is
+     never metered for a card that then does not exist */
+  const text = String(req.body?.text ?? '')
+    .trim()
+    .slice(0, actions.MAX_CHAT_CHARS)
+  if (!text) return res.status(400).json({ error: 'empty text' })
+  if (mentionedRole(text)) {
+    const gate = await allowance.consumeResidentTask(req.user!.id)
+    if (!gate.ok) {
+      return res.status(403).json({ error: 'resident_limit', used: gate.used, limit: gate.limit })
+    }
+  }
+  const message = actions.addChatMessage(req.params.id, text, req.user!.name, req.user!.id)
+  if (!message) return res.status(404).json({ error: 'canvas not found or empty text' })
+  res.json(message)
 })
 
 app.post('/api/canvases/:canvasId/cards/:id/done', (req, res) => {
@@ -1501,13 +1709,16 @@ function bridge(handler: (req: globalThis.Request) => Promise<globalThis.Respons
 }
 app.get('/.well-known/oauth-authorization-server', (req, res) => bridge(oAuthDiscoveryMetadata(auth))(req, res))
 
-/* Protected-resource metadata must echo the origin the CLIENT used (RFC 9728
-   — clients verify `resource` against the URL they connected to), while the
-   authorization server stays on the canonical origin. In dev the app may be
-   reached via :4300, :4301 (vite port bump) or :4400 — all must validate. */
+/* Protected-resource metadata must name the exact endpoint the CLIENT
+   connected to (RFC 9728 §3.3 — strict clients such as Muse reject a `resource`
+   that differs from the URL they called, so it is `<origin>/mcp`, never the bare
+   origin), while the authorization server stays on the canonical origin. In dev
+   the app may be reached via :4300, :4301 (vite port bump) or :4400 — all must
+   validate, so the origin is echoed from the request. Both well-known paths
+   serve the same document, the shape Linear ships. */
 function protectedResourceMetadata(req: express.Request, res: express.Response) {
   res.json({
-    resource: `${req.protocol}://${req.get('host')}`,
+    resource: `${req.protocol}://${req.get('host')}/mcp`,
     authorization_servers: [PUBLIC_ORIGIN],
     jwks_uri: `${PUBLIC_ORIGIN}/api/auth/mcp/jwks`,
     scopes_supported: ['openid', 'profile', 'email', 'offline_access'],
@@ -1565,7 +1776,14 @@ wss.on('connection', (ws, upgradeReq) => {
         return
       }
       const canvas = store.getCanvas(msg.canvasId)
-      if (!canvas) return
+      if (!canvas) {
+        /* a typo'd id or a canvas someone just deleted: say so and close,
+           instead of leaving the socket open with nothing ever coming back.
+           The client used to sit on a blank, unusable canvas UI forever
+           waiting for an 'init' that would never arrive. */
+        ws.close(4404, 'not found')
+        return
+      }
       if (!canAccessCanvas(session.user.id, canvas)) {
         ws.close(4403, 'no access')
         return
@@ -1591,6 +1809,7 @@ wss.on('connection', (ws, upgradeReq) => {
         tasks: actions.getTasks(msg.canvasId),
         feedback: actions.getFeedback(msg.canvasId),
         comments: actions.getComments(msg.canvasId),
+        chat: actions.getChat(msg.canvasId),
         decisions: actions.getDecisions(msg.canvasId),
         proposals: actions.getProposals(msg.canvasId),
         selfColor: presence.color,
@@ -1619,6 +1838,15 @@ wss.on('connection', (ws, upgradeReq) => {
       case 'cursor':
         presence.cursor = { x: msg.x, y: msg.y }
         broadcast(canvasId, { type: 'cursor', clientId: presence.clientId, x: msg.x, y: msg.y }, presence.clientId)
+        break
+      case 'viewport':
+        if (!isPeerViewport(msg.viewport)) break
+        presence.viewport = msg.viewport
+        broadcast(
+          canvasId,
+          { type: 'viewport', clientId: presence.clientId, viewport: msg.viewport },
+          presence.clientId,
+        )
         break
       case 'editing':
         presence.activeFrameId = msg.frameId
@@ -1671,4 +1899,5 @@ server.listen(PORT, () => {
   )
   /* automations fire from here: one tick a minute over the due rows */
   startScheduler()
+  for (const extension of extensions) extension.startWorker?.()
 })

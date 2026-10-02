@@ -1,13 +1,18 @@
+import { startLocalAgent } from './lib/localAgent'
 import { useEffect, useRef, useState } from 'react'
 import { Home } from './pages/Home'
 import { Community } from './pages/Community'
 import { Settings } from './pages/Settings'
 import { CanvasPage } from './pages/CanvasPage'
 import { AuthPage } from './pages/AuthPage'
+import { DesktopHandoff } from './pages/DesktopHandoff'
+import { DesktopSignIn } from './pages/DesktopSignIn'
+import { DESKTOP_HANDOFF_PATH, DESKTOP_SIGNIN_PATH } from './lib/desktopAuth'
 import { Admin } from './pages/Admin'
 import { Automations } from './pages/Automations'
 import { AutomationEditor } from './pages/AutomationEditor'
 import { Integrations } from './pages/Integrations'
+import { Workspace } from './pages/Workspace'
 import { authClient } from './lib/auth'
 import { setName } from './lib/identity'
 import { posthog, syncReplayForUser, suspendAnalyticsWhileImpersonating } from './lib/posthog'
@@ -90,6 +95,11 @@ export function App() {
     if (!isPending) setTabsUser(session?.user?.id ?? null)
   }, [isPending, session?.user?.id])
 
+  const localAgentUser = !isPending && me && !me.impersonating ? session?.user.id : undefined
+  useEffect(() => {
+    if (localAgentUser) return startLocalAgent(localAgentUser)
+  }, [localAgentUser])
+
   if (isPending)
     return (
       <>
@@ -97,6 +107,17 @@ export function App() {
         <AuthScreen />
       </>
     )
+  /* the desktop app sent this browser here to begin a provider sign-in on
+     its behalf (src/lib/desktopAuth.ts) — signed in or not, the page itself
+     decides where to go next */
+  if (path === DESKTOP_SIGNIN_PATH)
+    return (
+      <>
+        <ShellDragBar />
+        <DesktopSignIn signedIn={!!session} />
+      </>
+    )
+
   /* signed out: every path lands on the sign-in form. The marketing site is
      a separate service (see server/marketing.ts) that owns `/` for
      visitors; share links (/c/…) and interrupted MCP OAuth redirects keep
@@ -118,6 +139,8 @@ export function App() {
   const canvasId = path.match(/^\/c\/([^/]+)/)?.[1]
   const page = canvasId ? (
     <CanvasPage canvasId={canvasId} key={canvasId} />
+  ) : path === DESKTOP_HANDOFF_PATH ? (
+    <DesktopHandoff />
   ) : path.startsWith('/admin') ? (
     <Admin />
   ) : path.startsWith('/settings') ? (
@@ -126,6 +149,8 @@ export function App() {
     <Community />
   ) : path.startsWith('/integrations') ? (
     <Integrations />
+  ) : path.match(/^\/w\/([^/]+)/) ? (
+    <Workspace workspaceId={path.match(/^\/w\/([^/]+)/)![1]!} key={path} />
   ) : path.match(/^\/automations\/([^/]+)/) ? (
     <AutomationEditor automationId={path.match(/^\/automations\/([^/]+)/)![1]!} key={path} />
   ) : path.startsWith('/automations') ? (

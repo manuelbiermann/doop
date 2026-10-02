@@ -99,6 +99,62 @@
       "when": 1789165950163,
       "tag": "0013_integrations_unique",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1789193130109,
+      "tag": "0014_workspaces",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1789280000000,
+      "tag": "0015_card_scope",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1789783411083,
+      "tag": "0016_task_frames",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1789786843578,
+      "tag": "0017_local_agent",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1789789243227,
+      "tag": "0018_chat",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1790153504847,
+      "tag": "0020_image_prefs",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1790243905493,
+      "tag": "0021_agent_keys",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1790243905494,
+      "tag": "0022_linear_agent",
+      "breakpoints": true
     }
   ]
 }

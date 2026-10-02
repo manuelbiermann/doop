@@ -22,6 +22,49 @@ export interface LayerNode {
 /* markup that renders nothing of its own has no place in a layer list */
 const HIDDEN_TAGS = new Set(['SCRIPT', 'STYLE', 'LINK', 'META', 'TITLE', 'NOSCRIPT', 'TEMPLATE', 'BR', 'WBR'])
 const IMAGE_TAGS = new Set(['IMG', 'PICTURE', 'VIDEO', 'CANVAS'])
+/* elements the rail never offers an "inside" drop on: void elements
+   (serialization drops anything prepended into them), raw-text elements
+   (their content is text by definition) and restricted containers whose
+   children the parser rewrites — a <p> dropped into a <select> is discarded
+   on the next parse, one dropped into a <table> is hoisted out of it */
+const NO_INSIDE_DROP = new Set([
+  'AREA',
+  'BASE',
+  'BR',
+  'COL',
+  'EMBED',
+  'HR',
+  'IMG',
+  'INPUT',
+  'LINK',
+  'META',
+  'SOURCE',
+  'TRACK',
+  'WBR',
+  'TEXTAREA',
+  'SCRIPT',
+  'STYLE',
+  'TITLE',
+  'IFRAME',
+  'SELECT',
+  'OPTGROUP',
+  'OPTION',
+  'DATALIST',
+  'TABLE',
+  'THEAD',
+  'TBODY',
+  'TFOOT',
+  'TR',
+  'COLGROUP',
+])
+
+/** True when any layer element may be dropped into this one. The list is
+ *  the rail's hint; `moveElement` re-parses its result and refuses any move
+ *  the parser would not preserve, so a tag missing here still cannot lose
+ *  content. */
+export function holdsChildren(tag: string): boolean {
+  return !NO_INSIDE_DROP.has(tag.toUpperCase())
+}
 
 function escapeIdent(id: string): string {
   return typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(id) : id
@@ -50,6 +93,21 @@ export function elementPath(el: Element): string {
  *  must be open for its row to show. Walked on the tree rather than derived
  *  from the selector string: a path anchored on an #id says nothing about the
  *  elements above that id. Null when the selector is not in the tree. */
+/** The node a selector names, anywhere in the tree. */
+export function findLayer(nodes: LayerNode[], selector: string): LayerNode | null {
+  for (const n of nodes) {
+    if (n.selector === selector) return n
+    const hit = findLayer(n.children, selector)
+    if (hit) return hit
+  }
+  return null
+}
+
+/** The name a node shows for itself: "aside.rail", "#nav", or its text. */
+export function layerName(node: LayerNode): string {
+  return node.detail ? `${node.tag}${node.detail}` : node.label
+}
+
 export function ancestorsOf(nodes: LayerNode[], selector: string): LayerNode[] | null {
   for (const node of nodes) {
     if (node.selector === selector) return []
@@ -198,15 +256,22 @@ function alreadyAt(el: Element, at: Element, where: DropPlace): boolean {
 
 function move(doc: Document, el: Element, at: Element, where: DropPlace): MovedElement | null {
   if (el === at || el.contains(at) || alreadyAt(el, at, where)) return null
+  if (where === 'inside' && !holdsChildren(at.tagName)) return null
   if (where === 'inside') at.prepend(el)
   else if (where === 'before') at.before(el)
   else at.after(el)
-  return { html: serialize(doc), selector: elementPath(el) }
+  const html = serialize(doc)
+  const selector = elementPath(el)
+  /* the saved markup is what everyone re-parses: a move the parser would
+     drop or hoist (into a void element, a <select>, a <table>) is no move */
+  if (find(parse(html), selector)?.outerHTML !== el.outerHTML) return null
+  return { html, selector }
 }
 
 /** The frame's HTML with the element moved next to, or into, the target.
  *  Null when either selector no longer resolves, the target sits inside the
- *  element (a node cannot hold itself), or the element is already there. */
+ *  element (a node cannot hold itself), the target cannot hold it (an
+ *  <input>, a <select>), or the element is already there. */
 export function moveElement(html: string, selector: string, target: DropTarget): MovedElement | null {
   const doc = parse(html)
   const el = find(doc, selector)
